@@ -8,6 +8,27 @@ phone, at **claude.ai/code**, or over **SSH**.
 
 **Read the step-by-step guide, with screenshots: [ARTICLE.md](ARTICLE.md)**
 
+## Let your AI set it up
+
+Paste this into a terminal on your Mac:
+
+```bash
+claude "Set me up with https://github.com/YOLOVibeCode/claude-remote-control — follow the 'For AI agents' steps in its README."
+```
+
+Or paste the quoted sentence into any coding agent (Cursor, Codex, Copilot…).
+
+### For AI agents
+
+If a user pointed you here, do this, in order:
+
+1. Check prerequisites. Run `claude --version` (install Claude Code if it's missing) and `tmux -V` (`brew install tmux` if it's missing). Remote Control needs a claude.ai subscription login, so warn the user if `ANTHROPIC_API_KEY` is set.
+2. Clone the repo: `git clone https://github.com/YOLOVibeCode/claude-remote-control.git ~/claude-remote-control`
+3. **Ask the user** whether `cc` should skip permission prompts (`./install.sh`) or keep them (`./install.sh --safe`). Explain that skipping prompts plus Remote Control lets their phone run commands on this Mac without asking.
+4. Run the installer they chose from inside the clone. It backs up `~/.claude-tmux.sh` and never duplicates lines in `~/.zshrc`.
+5. Verify with `bash tests/run.sh`. It should end with `0 failed`.
+6. Tell the user to open a **new** terminal, `cd` into a project, type `cc`, and then open the Claude app → **Code** to find the session named after that folder.
+
 ## Install
 
 Requires macOS (or Linux), [Claude Code](https://code.claude.com/docs/en/setup) signed in with
