@@ -249,4 +249,14 @@ cd claude-remote-control
 
 The installer backs up anything it replaces, never adds a duplicate block to your `~/.zshrc`, and can undo itself with `./install.sh --uninstall`. `tests/run.sh` checks the wrapper's behavior in bash and zsh against stub `claude` and `tmux` binaries, and CI runs it on macOS and Linux.
 
+### Or have your AI set it up for you
+
+Don't want to do any of this by hand? Paste this into your terminal:
+
+```bash
+claude "Set me up with https://github.com/YOLOVibeCode/claude-remote-control — follow the 'For AI agents' steps in its README."
+```
+
+Claude checks your prerequisites, clones the repo and asks whether you want permission prompts on or off. Then it runs the installer and the tests and tells you what to do next. The quoted sentence works in any coding agent too: Cursor, Codex, Copilot and the rest.
+
 Two letters, and the session follows you.
