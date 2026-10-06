@@ -62,6 +62,10 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(classify(entry(), True, None, h, NOW), State.RESTART_FAILED)
         self.assertEqual(classify(entry(), False, None, h, NOW), State.RESTART_FAILED)
 
+    def test_a_failed_restart_is_retried_once_its_restart_is_an_hour_old(self):
+        h = History(restarts=(NOW - 3700,), last_state=State.RESTART_FAILED)
+        self.assertEqual(classify(entry(), False, None, h, NOW), State.DEAD)
+
     def test_a_restart_that_came_up_on_the_right_conversation_is_ok(self):
         h = History(restarts=(NOW - 30,))
         self.assertEqual(classify(entry(), True, record(), h, NOW), State.OK)
