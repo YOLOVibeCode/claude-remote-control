@@ -8,7 +8,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install zsh (Linux)
+      - name: Install zsh and tmux (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh tmux
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: command -v tmux || brew install tmux
       - run: bash tests/run.sh

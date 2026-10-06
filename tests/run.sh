@@ -61,6 +61,18 @@ shells="bash"
 command -v zsh >/dev/null 2>&1 && shells="bash zsh"
 
 echo "syntax"
+if command -v tmux >/dev/null 2>&1; then   # the real tmux, before the stubs go on PATH
+  sock="rc-test-$$"
+  if tmux -L "$sock" -f "$root/shell/tmux.conf" new-session -d "sleep 5" 2>/dev/null; then
+    got="mouse=$(tmux -L "$sock" show -gv mouse) copy=$(tmux -L "$sock" show -sv copy-command) clip=$(tmux -L "$sock" show -sv set-clipboard)"
+    want="mouse=on copy= clip=external"
+    command -v pbcopy >/dev/null 2>&1 && want="mouse=on copy=pbcopy clip=external"
+    [ "$got" = "$want" ] && ok "real tmux loads shell/tmux.conf ($want)" || bad "real tmux loads shell/tmux.conf" "got $got, want $want"
+    tmux -L "$sock" kill-server 2>/dev/null
+  else
+    bad "real tmux starts with shell/tmux.conf"
+  fi
+fi
 for sh in $shells; do
   if $sh -n "$root/shell/claude-tmux.sh" 2>/dev/null; then ok "$sh parses claude-tmux.sh"; else bad "$sh parses claude-tmux.sh"; fi
 done
@@ -118,12 +130,15 @@ inst
 grep -q 'alias cc="claude --dangerously-skip-permissions"' "$H/.zshrc" && ok "adds the cc alias" || bad "adds the cc alias"
 grep -q 'export FOO=1' "$H/.zshrc" && ok "keeps existing .zshrc content" || bad "keeps existing .zshrc content"
 grep -q 'set -g mouse on' "$H/.tmux.conf" && ok "writes tmux settings" || bad "writes tmux settings"
+grep -q 'set -s copy-command pbcopy' "$H/.tmux.conf" && ok "writes the copy-to-clipboard line" || bad "writes the copy-to-clipboard line"
 
 inst
 n=$(grep -c '>>> claude-remote-control >>>' "$H/.zshrc")
 [ "$n" = 1 ] && ok "second run does not duplicate the block" || bad "second run does not duplicate the block" "found $n"
 n=$(grep -c 'set -g mouse on' "$H/.tmux.conf")
 [ "$n" = 1 ] && ok "second run does not duplicate tmux lines" || bad "second run does not duplicate tmux lines" "found $n"
+n=$(grep -c 'copy-command' "$H/.tmux.conf")
+[ "$n" = 1 ] && ok "second run does not duplicate the copy line" || bad "second run does not duplicate the copy line" "found $n"
 
 inst --safe
 grep -q 'alias cc="claude"' "$H/.zshrc" && ok "--safe drops the bypass flag" || bad "--safe drops the bypass flag"

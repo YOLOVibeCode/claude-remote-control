@@ -49,7 +49,7 @@ Open a new terminal, `cd` into a project and type `cc`.
 | File | What it does |
 | --- | --- |
 | [`shell/claude-tmux.sh`](shell/claude-tmux.sh) | A `claude()` wrapper that runs interactive sessions in tmux with `--remote-control <folder>`. Also `cpick` (a session menu on SSH login) and `ccserve` (an always-on `claude remote-control` server, so the app can start new sessions) |
-| [`shell/tmux.conf`](shell/tmux.conf) | Five tmux settings: mouse, scrollback, fast Esc, tab titles |
+| [`shell/tmux.conf`](shell/tmux.conf) | Six tmux settings: mouse, scrollback, fast Esc, tab titles, and drag-to-copy into the macOS clipboard |
 | [`install.sh`](install.sh) | Idempotent installer with backups, `--safe` and `--uninstall` |
 | [`tests/run.sh`](tests/run.sh) | Wrapper and installer tests (bash + zsh, stub `claude`/`tmux`) |
 | [`tools/screenshots/`](tools/screenshots/) | How the terminal screenshots were captured, with IDs masked |

@@ -1,6 +1,6 @@
 # I Type Two Letters on My Mac and Keep Coding From My Phone
 
-*Claude Code, Remote Control, a five-line tmux config and one shell function. The exact setup, step by step.*
+*Claude Code, Remote Control, a six-line tmux config and one shell function. The exact setup, step by step.*
 
 ---
 
@@ -118,19 +118,27 @@ What it does:
 
 **Why not just turn on "Enable Remote Control for all sessions"?** Claude Code has that setting too (`/config`, or `remoteControlAtStartup: true`). It turns Remote Control on, but it doesn't put the session in tmux or name it after the folder. The tmux part is what keeps a session alive when you close the terminal window, and what makes plan B (SSH) possible.
 
-## Step 4: Five lines of tmux config
+## Step 4: Six lines of tmux config
 
 `~/.tmux.conf`:
 
 ```
-set -g mouse on            # scroll with trackpad or finger (Option-drag to select text on the Mac)
+set -g mouse on            # scroll with trackpad or finger; plain drag copies (hold Shift in Ghostty, Fn in Terminal.app, Option in iTerm2 for the terminal's own selection)
 set -g history-limit 50000
 set -sg escape-time 10     # Esc reaches Claude immediately
 set -g set-titles on       # terminal tab shows the session's title
 set -g set-titles-string '#S: #T'
+if-shell "command -v pbcopy >/dev/null" "set -s copy-command pbcopy"
 ```
 
 `escape-time` matters most. tmux's default delay makes **Esc**, which interrupts Claude, feel broken.
+
+The first and last lines work as a pair. `mouse on` lets you scroll Claude's output with the trackpad, or with your finger over SSH. The catch is that tmux then takes over click-and-drag, so the terminal's own selection and ⌘C stop working. The last line fixes that: anything you select in tmux (a drag, a double-click on a word, a triple-click on a line) goes straight to the macOS clipboard, ready for ⌘V. A few things to know:
+
+- **Ctrl+C isn't copy on a Mac.** In Claude Code it interrupts. Copy with a drag, or use ⌘C after a Shift- or Fn-drag.
+- **Every selection replaces your clipboard,** including accidental drags. If Handoff is on, it also syncs to your iPhone through Universal Clipboard, so don't drag across API keys.
+- **Over SSH, the text lands on the Mac's clipboard,** because that's where tmux runs.
+- **Leave `set-clipboard` at its default.** Setting it to `on` would let any program running inside tmux write to your clipboard. That includes commands Claude runs without asking.
 
 ## Step 5: Type `cc`
 
