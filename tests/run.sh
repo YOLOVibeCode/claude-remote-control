@@ -29,13 +29,23 @@ echo "claude-direct $*" >> "$LOG"
 EOF
 chmod +x "$work/bin/tmux" "$work/bin/claude"
 
-# The wrapper only takes over on a real terminal, so run each case under a pty.
+# The wrapper only takes over on a real terminal, so run each case on a pseudo-terminal.
+# Python's pty module gives the child a tty on stdin/stdout without forwarding our stdin;
+# `script` forwards EOF from a non-tty stdin and could end the shell before it ran anything.
 in_pty() {  # in_pty <shell> <script>
-  if script --version >/dev/null 2>&1; then              # util-linux (Linux)
-    script -qec "$1 -c '$2'" /dev/null >/dev/null 2>&1
-  else                                                     # BSD script (macOS)
-    script -q /dev/null "$1" -c "$2" >/dev/null 2>&1
-  fi
+  python3 - "$1" -c "$2" <<'PY'
+import os, pty, subprocess, sys
+master, slave = pty.openpty()
+child = subprocess.Popen(sys.argv[1:], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+os.close(slave)
+while True:  # drain output until the child closes the terminal
+    try:
+        if not os.read(master, 4096):
+            break
+    except OSError:
+        break
+sys.exit(child.wait())
+PY
 }
 
 run_case() {  # run_case <shell> <dir> <claude args...>
