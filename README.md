@@ -121,6 +121,14 @@ One SMS per change (restarted, needs you, back), never one per run; undelivered 
 retried next run. Adding a vendor is one class in `claude_rc/notify/` plus one line in its
 registry; `tests/test_providers.py` checks it against the same contract as the others.
 
+**Outside heartbeat (dead-man switch).** Nothing on this Mac can report the Mac itself being
+down (asleep, powered off, at the FileVault screen, offline). With a `heartbeat` section in
+`config.json`, every watch run POSTs `{source, host, ok, total, needs_you}` to an always-on
+service, which texts you once when beats stop and once when they resume. The reference
+receiver is `POST /v1/heartbeat` in [cloud-agents](https://github.com/rvegajr/cloud-agents)
+(`HEARTBEAT_TOKEN`, separate from any token that can do more). A failed beat is logged and never
+stops the watchdog.
+
 **Reboots.** launchd user agents start at login. With FileVault on, a reboot waits for someone to
 log in; for unattended reboots, turn on automatic login (System Settings → Users & Groups) only if
 that trade-off is acceptable for this Mac.

@@ -13,8 +13,9 @@ from __future__ import annotations
 
 from typing import Dict, Mapping
 
-from ..ports import EmailSender, TextSender
+from ..ports import EmailSender, HeartbeatSender, TextSender
 from .console import ConsoleEmail, ConsoleText
+from .heartbeat import ConsoleHeartbeat, HttpHeartbeat
 from .relay import RelayEmail, RelayText
 from .sendgrid import SendGridEmail
 from .smtp import SmtpEmail
@@ -31,6 +32,12 @@ EMAIL_PROVIDERS: Dict[str, type] = {
     "sendgrid": SendGridEmail,
     "smtp": SmtpEmail,
     "console": ConsoleEmail,
+}
+
+
+HEARTBEAT_PROVIDERS: Dict[str, type] = {
+    "http": HttpHeartbeat,
+    "console": ConsoleHeartbeat,
 }
 
 
@@ -71,3 +78,7 @@ def build_text_sender(cfg: Mapping, env: Mapping[str, str]) -> TextSender:
 
 def build_email_sender(cfg: Mapping, env: Mapping[str, str]) -> EmailSender:
     return _build("email", EMAIL_PROVIDERS, cfg, env)
+
+
+def build_heartbeat_sender(cfg: Mapping, env: Mapping[str, str]) -> HeartbeatSender:
+    return _build("heartbeat", HEARTBEAT_PROVIDERS, cfg, env)
