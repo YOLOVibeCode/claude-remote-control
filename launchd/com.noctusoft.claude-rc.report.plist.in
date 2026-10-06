@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.noctusoft.claude-rc.report</string>
+  <!-- Daily all-clear email. -->
+  <key>ProgramArguments</key>
+  <array><string>__BIN__</string><string>report</string></array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>30</integer></dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>__PATH__</string>
+    <key>HOME</key><string>__HOME__</string>
+  </dict>
+  <key>StandardOutPath</key><string>__HOME__/.config/claude-rc/launchd.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.config/claude-rc/launchd.log</string>
+</dict>
+</plist>

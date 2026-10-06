@@ -39,7 +39,12 @@ cat > "$work/bin/uuidgen" <<'EOF'
 #!/bin/sh
 echo "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
 EOF
-chmod +x "$work/bin/tmux" "$work/bin/claude" "$work/bin/claude-rc" "$work/bin/uuidgen"
+cat > "$work/bin/launchctl" <<'EOF'
+#!/bin/sh
+echo "launchctl $*" >> "$LOG"
+exit 0
+EOF
+chmod +x "$work/bin/tmux" "$work/bin/claude" "$work/bin/claude-rc" "$work/bin/uuidgen" "$work/bin/launchctl"
 
 # The wrapper only takes over on a real terminal, so run each case on a pseudo-terminal.
 # Python's pty module gives the child a tty on stdin/stdout without forwarding our stdin;
@@ -174,6 +179,28 @@ grep -q 'alias cc="claude"' "$H/.zshrc" && ok "--safe drops the bypass flag" || 
 inst --uninstall
 grep -q 'claude-remote-control' "$H/.zshrc" && bad "--uninstall removes the block" || ok "--uninstall removes the block"
 grep -q 'export FOO=1' "$H/.zshrc" && ok "--uninstall keeps the rest of .zshrc" || bad "--uninstall keeps the rest of .zshrc"
+
+[ -x "$H/.local/bin/claude-rc" ] && ok "installs claude-rc" || bad "installs claude-rc"
+[ -f "$H/.local/share/claude-rc/claude_rc/core.py" ] && ok "...with its package" || bad "...with its package"
+[ -f "$H/Library/LaunchAgents/com.noctusoft.claude-rc.watch.plist" ] && bad "plain install does not schedule the watchdog" || ok "plain install does not schedule the watchdog"
+
+: > "$LOG"
+inst --supervise
+W="$H/Library/LaunchAgents/com.noctusoft.claude-rc.watch.plist"
+R="$H/Library/LaunchAgents/com.noctusoft.claude-rc.report.plist"
+[ -f "$W" ] && ok "--supervise writes the watch agent" || bad "--supervise writes the watch agent"
+[ -f "$R" ] && ok "--supervise writes the report agent" || bad "--supervise writes the report agent"
+grep -q '<integer>600</integer>' "$W" 2>/dev/null && ok "watch runs every 10 minutes" || bad "watch runs every 10 minutes"
+grep -q '<key>RunAtLoad</key>' "$W" 2>/dev/null && ok "watch runs at login (after a reboot)" || bad "watch runs at login (after a reboot)"
+grep -q "$H/.local/bin/claude-rc" "$W" 2>/dev/null && ok "watch calls the installed claude-rc" || bad "watch calls the installed claude-rc"
+grep -q '__' "$W" "$R" 2>/dev/null && bad "no template placeholders left" || ok "no template placeholders left"
+plutil -lint "$W" "$R" >/dev/null 2>&1 && ok "plists are valid" || { command -v plutil >/dev/null || ok "plists are valid (plutil n/a)"; command -v plutil >/dev/null && bad "plists are valid"; }
+check "--supervise loads both agents" 'launchctl bootstrap gui/[0-9]+ .*claude-rc.watch.plist'
+
+: > "$LOG"
+inst --uninstall
+check "--uninstall unloads the agents" 'launchctl bootout gui/[0-9]+/com.noctusoft.claude-rc.watch'
+[ -f "$W" ] && bad "--uninstall removes the agents" || ok "--uninstall removes the agents"
 
 printf 'alias cc="claude --model opus"\n' > "$H/.zshrc"
 inst

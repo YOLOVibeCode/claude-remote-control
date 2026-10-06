@@ -50,8 +50,10 @@ Open a new terminal, `cd` into a project and type `cc`.
 | --- | --- |
 | [`shell/claude-tmux.sh`](shell/claude-tmux.sh) | A `claude()` wrapper that runs interactive sessions in tmux with `--remote-control <folder>`. Also `cpick` (a session menu on SSH login) and `ccserve` (an always-on `claude remote-control` server, so the app can start new sessions) |
 | [`shell/tmux.conf`](shell/tmux.conf) | Six tmux settings: mouse, scrollback, fast Esc, tab titles, and drag-to-copy into the macOS clipboard |
-| [`install.sh`](install.sh) | Idempotent installer with backups, `--safe` and `--uninstall` |
-| [`tests/run.sh`](tests/run.sh) | Wrapper and installer tests (bash + zsh, stub `claude`/`tmux`) |
+| [`install.sh`](install.sh) | Idempotent installer with backups, `--safe`, `--supervise` and `--uninstall` |
+| [`claude_rc/`](claude_rc/), [`bin/claude-rc`](bin/claude-rc) | Pins each tmux session to its conversation, restarts dead ones, alerts and reports (see Supervision) |
+| [`launchd/`](launchd/) | Templates for the 10-minute watchdog and the daily report |
+| [`tests/`](tests/) | `run.sh`: wrapper and installer tests (bash + zsh, stub `claude`/`tmux`), then the Python suite |
 | [`tools/screenshots/`](tools/screenshots/) | How the terminal screenshots were captured, with IDs masked |
 
 ## Commands
@@ -62,6 +64,63 @@ Open a new terminal, `cd` into a project and type `cc`.
 | `/remote-control` | Inside a session: show the URL and QR code, or reconnect |
 | `ccserve` | Start the Remote Control server in tmux session `remote` (`ccserve restart`) |
 | `cpick` | Pick a tmux session to attach to (runs on its own at SSH login; `NOMENU=1` skips it) |
+
+## Supervision: survive outages and reboots
+
+A restart that only knows a session's *name* opens a blank conversation. `claude-rc` pins every
+tmux session to its conversation id and brings it back with `--resume <id>`, so a crash or a
+reboot returns the same chat, in the same folder, under the same Remote Control name.
+
+```bash
+./install.sh --supervise        # installs claude-rc, schedules the watchdog + daily report, adopts running sessions
+```
+
+| Command | Effect |
+| --- | --- |
+| `claude-rc adopt` | Record every running tmux session in `~/.config/claude-rc/sessions.json` (never overwrites an entry) |
+| `claude-rc check` | Each pinned session's state; exit 1 if any needs you (`--json` for scripts) |
+| `claude-rc watch` | What launchd runs every 10 min and at login: restart, relink, alert on changes |
+| `claude-rc up [name]` | Start pinned sessions that are down, by hand |
+| `claude-rc report` | Email the all-clear now |
+| `claude-rc notify-test alerts\|report` | Send one test message through the configured provider |
+
+New sessions are pinned at birth: the `claude()` wrapper passes `--session-id <uuid>` and records
+it. Each manifest line holds `name`, `dir`, `conversation`, `flags` (reused on restart; seeded as
+`--dangerously-skip-permissions`) and `enabled` (set `false` to leave a session alone).
+
+**States.** `OK` alive on its conversation and linked. `DEAD` no tmux session: restarted (3 an
+hour at most, then `GAVE_UP`). `UNLINKED` Remote Control dropped: when the session is idle for
+two runs, `/remote-control` is typed into it once (`UNLINKED_STUCK` if that did not work).
+`WRONG_CONVERSATION` and `NOT_RUNNING` are reported and never touched. `RESTART_FAILED` means a
+restart never registered; the pane's last lines go to `~/.config/claude-rc/watch.log`.
+
+**Alerts and the daily report** go through pluggable providers, chosen per channel in
+`~/.config/claude-rc/config.json` (copy [`config.example.json`](config.example.json)):
+
+| Provider | Alerts (SMS) | Report (email) |
+| --- | --- | --- |
+| `noctusoft-relay` | ✓ | ✓ |
+| `twilio` | ✓ | |
+| `smtp` (any mailbox) | | ✓ |
+| `sendgrid` | | ✓ |
+| `console` (dry run) | ✓ | ✓ |
+
+`env` in the config names environment variables; their values live in
+`~/.config/claude-rc/secrets.env` (chmod 600), for example filled from 1Password without printing:
+
+```bash
+printf 'NOCTUSOFT_API_KEY=%s\n' "$(op read 'op://<vault>/<item-id>/credential')" > ~/.config/claude-rc/secrets.env
+chmod 600 ~/.config/claude-rc/secrets.env
+claude-rc notify-test alerts
+```
+
+One SMS per change (restarted, needs you, back), never one per run; undelivered alerts are
+retried next run. Adding a vendor is one class in `claude_rc/notify/` plus one line in its
+registry; `tests/test_providers.py` checks it against the same contract as the others.
+
+**Reboots.** launchd user agents start at login. With FileVault on, a reboot waits for someone to
+log in; for unattended reboots, turn on automatic login (System Settings → Users & Groups) only if
+that trade-off is acceptable for this Mac.
 
 ## Safety
 

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.noctusoft.claude-rc.watch</string>
+  <!-- Record any new tmux hosts, then restart/relink what is safe and alert on changes. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>"__BIN__" adopt --quiet; exec "__BIN__" watch</string>
+  </array>
+  <key>StartInterval</key><integer>600</integer>
+  <!-- Also at login, so a reboot is recovered without waiting 10 minutes. -->
+  <key>RunAtLoad</key><true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>__PATH__</string>
+    <key>HOME</key><string>__HOME__</string>
+  </dict>
+  <key>StandardOutPath</key><string>__HOME__/.config/claude-rc/launchd.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.config/claude-rc/launchd.log</string>
+</dict>
+</plist>
