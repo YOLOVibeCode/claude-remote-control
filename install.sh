@@ -84,11 +84,18 @@ for rc in $(rcfiles); do
     aliases="alias cc=\"claude${flags:+ $flags}\"
 alias ccc=\"claude${flags:+ $flags} -c\""
   fi
+  # Already sourced by a line of the user's own (outside our block)? Then do not source it twice:
+  # the wrapper shows the cpick menu at SSH login, and a second source would show it twice.
+  source_line='[ -f "$HOME/.claude-tmux.sh" ] && . "$HOME/.claude-tmux.sh"'
+  if grep -qF '.claude-tmux.sh' "$rc"; then
+    echo "note: $rc already sources ~/.claude-tmux.sh; not adding another"
+    source_line=""
+  fi
   {
     echo ""
     echo "$begin"
     [ -n "$aliases" ] && echo "$aliases"
-    echo '[ -f "$HOME/.claude-tmux.sh" ] && . "$HOME/.claude-tmux.sh"'
+    [ -n "$source_line" ] && echo "$source_line"
     echo "$end"
   } >> "$rc"
   echo "updated $rc"

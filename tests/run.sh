@@ -202,6 +202,11 @@ inst --uninstall
 check "--uninstall unloads the agents" 'launchctl bootout gui/[0-9]+/com.noctusoft.claude-rc.watch'
 [ -f "$W" ] && bad "--uninstall removes the agents" || ok "--uninstall removes the agents"
 
+printf '# mine\n[ -f "$HOME/.claude-tmux.sh" ] && . "$HOME/.claude-tmux.sh"\n' > "$H/.zshrc"
+inst
+n=$(grep -c 'claude-tmux.sh" ] && \.' "$H/.zshrc")
+[ "$n" = 1 ] && ok "an existing source line is not duplicated (SSH menu would show twice)" || bad "an existing source line is not duplicated (SSH menu would show twice)" "found $n"
+
 printf 'alias cc="claude --model opus"\n' > "$H/.zshrc"
 inst
 [ "$(grep -c '^alias cc=' "$H/.zshrc")" = 1 ] && ok "an existing cc alias is left alone" || bad "an existing cc alias is left alone"
