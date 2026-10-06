@@ -16,7 +16,7 @@ from urllib.parse import parse_qs
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from claude_rc.notify import ConfigError, build_email_sender, build_text_sender  # noqa: E402
+from claude_rc.notify import ConfigError, build_email_sender, build_heartbeat_sender, build_text_sender  # noqa: E402
 from claude_rc.ports import DeliveryError  # noqa: E402
 
 SECRET = "sk_live_DO_NOT_LEAK_123456"
@@ -253,6 +253,34 @@ class EmailContract(unittest.TestCase):
         with self.assertRaises(DeliveryError) as ctx:
             build_email_sender(cfg, {"SMTP_USER": "rc", "SMTP_PASS": SECRET}).send_email("me@example.com", "s", "x")
         self.assertNotIn(SECRET, str(ctx.exception))
+
+
+class HeartbeatContract(unittest.TestCase):
+    def setUp(self):
+        self.stub = StubHTTP()
+
+    def tearDown(self):
+        self.stub.close()
+
+    def cfg(self, url):
+        return {"provider": "http", "env": {"token": "HB_TOKEN"}, "options": {"url": f"{url}/v1/heartbeat"}}
+
+    def test_http_beat_posts_json_with_its_own_bearer_token(self):
+        build_heartbeat_sender(self.cfg(self.stub.url), {"HB_TOKEN": SECRET}).beat(
+            {"source": "claude-rc", "host": "mac", "ok": 16, "total": 16, "needs_you": 0})
+        req = self.stub.requests[0]
+        self.assertEqual(req["path"], "/v1/heartbeat")
+        self.assertEqual(req["headers"]["authorization"], f"Bearer {SECRET}")
+        self.assertEqual(json.loads(req["body"]), {"source": "claude-rc", "host": "mac", "ok": 16, "total": 16, "needs_you": 0})
+
+    def test_http_beat_failure_is_a_delivery_error_without_the_token(self):
+        self.stub.status = 401
+        with self.assertRaises(DeliveryError) as ctx:
+            build_heartbeat_sender(self.cfg(self.stub.url), {"HB_TOKEN": SECRET}).beat({"source": "claude-rc"})
+        self.assertNotIn(SECRET, str(ctx.exception))
+
+    def test_console_beat_needs_nothing(self):
+        build_heartbeat_sender({"provider": "console"}, {}).beat({"source": "claude-rc"})
 
 
 class RegistryTest(unittest.TestCase):

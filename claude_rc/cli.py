@@ -20,6 +20,7 @@ import fcntl
 import json
 import os
 import shutil
+import socket
 import sys
 import time
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, TextIO, Tuple
@@ -80,9 +81,9 @@ def flags_to_record(args: Sequence[str]) -> Tuple[str, ...]:
 class App:
     def __init__(self, home: str, registry, mux, manifest, state, clock, claude_bin: str,
                  text: Channel, mail: Channel, out: TextIO = sys.stdout, sleep: Callable[[float], None] = time.sleep,
-                 trust=None):
+                 trust=None, heartbeat: Optional[Callable[[], object]] = None, hostname: str = ""):
         self.home, self.registry, self.mux, self.manifest, self.state = home, registry, mux, manifest, state
-        self.trust = trust
+        self.trust, self.heartbeat, self.hostname = trust, heartbeat, hostname
         self.clock, self.claude_bin, self.text, self.mail, self.out, self.sleep = clock, claude_bin, text, mail, out, sleep
 
     # --- helpers ----------------------------------------------------------------------------
@@ -228,7 +229,22 @@ class App:
             queued = queued + [msg]
         queued = self._deliver(queued)
         self.state.save(conditions, histories, queued[-QUEUE_LIMIT:])
+        self._beat(conditions)
         return 0
+
+    def _beat(self, conditions: Dict[str, str]) -> None:
+        """Tell the outside dead-man switch this run happened. Never fatal."""
+        sender = self.heartbeat() if self.heartbeat else None
+        if sender is None:
+            return
+        payload = {"source": "claude-rc", "host": self.hostname,
+                   "ok": sum(1 for c in conditions.values() if c == "OK"),
+                   "total": len(conditions),
+                   "needs_you": sum(1 for c in conditions.values() if c in NEEDS_YOU)}
+        try:
+            sender.beat(payload)  # type: ignore[attr-defined]
+        except DeliveryError as e:
+            self.log(f"heartbeat not delivered ({e})")
 
     def _await_restarts(self, names: List[str], entries: List[Entry], conditions: Dict[str, str],
                         histories: Dict[str, History]) -> None:
@@ -338,7 +354,7 @@ def build_app(home: Optional[str] = None) -> App:
     from .adapters.registry import FileSessionRegistry
     from .adapters.tmux import TmuxMultiplexer
     from .adapters.trust import ClaudeJsonTrust
-    from .notify import ConfigError, build_email_sender, build_text_sender
+    from .notify import ConfigError, build_email_sender, build_heartbeat_sender, build_text_sender
 
     home = home or os.environ.get("CLAUDE_RC_HOME") or os.path.expanduser("~/.config/claude-rc")
     config = read_json(os.path.join(home, "config.json"), {})
@@ -357,6 +373,16 @@ def build_app(home: Optional[str] = None) -> App:
                 return None
         return make
 
+    def heartbeat_channel():
+        cfg = config.get("heartbeat")
+        if not cfg:
+            return None
+        try:
+            return build_heartbeat_sender(cfg, env)
+        except ConfigError as e:
+            print(f"claude-rc: heartbeat config: {e}", file=sys.stderr)
+            return None
+
     class _Clock:
         def now(self) -> float:
             return time.time()
@@ -366,7 +392,8 @@ def build_app(home: Optional[str] = None) -> App:
                manifest=JsonManifestStore(os.path.join(home, "sessions.json")),
                state=JsonStateStore(os.path.join(home, "state.json")), clock=_Clock(), claude_bin=_claude_bin(),
                text=channel("alerts", build_text_sender), mail=channel("report", build_email_sender),
-               trust=ClaudeJsonTrust())
+               trust=ClaudeJsonTrust(), heartbeat=heartbeat_channel,
+               hostname=socket.gethostname().split(".")[0])
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

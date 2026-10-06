@@ -48,6 +48,10 @@ class EmailSender(Protocol):
     def send_email(self, to: str, subject: str, html: str) -> None: ...
 
 
+class HeartbeatSender(Protocol):
+    def beat(self, payload: dict) -> None: ...
+
+
 class DeliveryError(Exception):
     """A provider could not deliver. Carries no secrets."""
 

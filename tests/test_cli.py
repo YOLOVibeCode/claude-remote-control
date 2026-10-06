@@ -80,6 +80,18 @@ class AppTest(unittest.TestCase):
         self.mux = FakeMux(self.reg)
         self.clock = Clock()
         self.text, self.mail = Capture(), Capture()
+        outer = self
+
+        class Beats:
+            sent, fail = [], False
+
+            def beat(self, payload):
+                if self.fail:
+                    raise DeliveryError("stub", "unreachable")
+                self.sent.append(payload)
+
+        self.beats = Beats()
+        self.beats.sent = []
         self.out = io.StringIO()
         self.manifest = JsonManifestStore(os.path.join(self.home, "sessions.json"))
         self.state = JsonStateStore(os.path.join(self.home, "state.json"))
@@ -96,7 +108,8 @@ class AppTest(unittest.TestCase):
         base = dict(home=self.home, registry=self.reg, mux=self.mux, manifest=self.manifest, state=self.state,
                     trust=self.trust,
                     clock=self.clock, claude_bin=BIN, text=lambda: (self.text, "+15125550100"),
-                    mail=lambda: (self.mail, "me@example.com"), out=self.out, sleep=lambda s: None)
+                    mail=lambda: (self.mail, "me@example.com"), out=self.out, sleep=lambda s: None,
+                    heartbeat=lambda: self.beats, hostname="mac")
         base.update(kw)
         return App(**base)
 
@@ -225,6 +238,21 @@ class AppTest(unittest.TestCase):
         self.app().watch()
         mode = stat.S_IMODE(os.stat(os.path.join(self.home, "watch.log")).st_mode)
         self.assertEqual(mode, 0o600)
+
+    def test_every_watch_run_beats_with_its_counts(self):
+        self.pin_app()
+        self.mux.sessions.add("app")
+        self.reg.records = [Record(1, CONV, "/w/app", "app", "idle", True, "2.1.291", True)]
+        self.app().watch()
+        self.assertEqual(self.beats.sent, [{"source": "claude-rc", "host": "mac", "ok": 1, "total": 1, "needs_you": 0}])
+
+    def test_a_failed_beat_is_logged_and_never_stops_the_watch(self):
+        self.pin_app()
+        self.beats.fail = True
+        self.assertEqual(self.app().watch(), 0)
+        self.assertEqual(len(self.mux.calls), 1)  # the restart still happened
+        with open(os.path.join(self.home, "watch.log")) as f:
+            self.assertIn("heartbeat not delivered", f.read())
 
     # check / report --------------------------------------------------------------------------
     def test_check_exits_nonzero_when_something_is_wrong_and_prints_json(self):
