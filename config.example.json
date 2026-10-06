@@ -1,0 +1,23 @@
+{
+  "alerts": {
+    "provider": "noctusoft-relay",
+    "to": "+15125550100",
+    "env": { "api_key": "NOCTUSOFT_API_KEY" }
+  },
+  "report": {
+    "provider": "noctusoft-relay",
+    "to": "you@example.com",
+    "env": { "api_key": "NOCTUSOFT_API_KEY" }
+  },
+
+  "_other_providers": {
+    "twilio (alerts)": { "provider": "twilio", "to": "+15125550100",
+      "env": { "account_sid": "TWILIO_ACCOUNT_SID", "auth_token": "TWILIO_AUTH_TOKEN", "from": "TWILIO_FROM" } },
+    "smtp (report)": { "provider": "smtp", "to": "you@example.com",
+      "env": { "username": "SMTP_USER", "password": "SMTP_PASSWORD" },
+      "options": { "host": "smtp.gmail.com", "port": 587, "from": "you@example.com" } },
+    "sendgrid (report)": { "provider": "sendgrid", "to": "you@example.com",
+      "env": { "api_key": "SENDGRID_API_KEY" }, "options": { "from": "alerts@example.com" } },
+    "console (either)": { "provider": "console", "to": "-" }
+  }
+}

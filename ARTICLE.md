@@ -217,6 +217,22 @@ Type a number to attach. You're now in the same Claude Code session that's on yo
 
 ---
 
+## Step 9 (optional): Keep every session alive through outages and reboots
+
+The day the network drops for an hour, or the Mac reboots for an update, every tmux session is
+gone. Starting them again by name is the trap: `claude --remote-control my-app` opens a *new*,
+empty conversation, and the chat you were driving from your phone is still there, just no longer
+attached to anything. Pin each session to its conversation instead, and restart with
+`--resume <conversation-id>`: same chat, same folder, same name on the phone.
+
+That is what `claude-rc` does. `./install.sh --supervise` records every running session, and a
+launchd job runs every 10 minutes and at login. It restarts what died, checks that each session
+is on the conversation it is supposed to be (alive is not the same as useful), retypes
+`/remote-control` into an idle session whose link dropped, and texts you once per change. A
+daily email lists every session and its state, which is how you notice the quiet failures.
+Alerts and the email go through whichever provider you configure (Twilio, SMTP, SendGrid, or your
+own relay). See the README's Supervision section for the commands and the config.
+
 ## How I actually use it
 
 - **Kick off, walk away.** "Upgrade the dependencies, run the test suite, fix what breaks, and notify me when it's green." Then I go do something else.

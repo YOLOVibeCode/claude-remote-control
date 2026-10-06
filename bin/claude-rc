@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Entry point: resolves the claude_rc package next to this file, or under ~/.local/share/claude-rc."""
+import os
+import sys
+
+here = os.path.dirname(os.path.realpath(__file__))
+for root in (os.path.dirname(here), os.path.expanduser("~/.local/share/claude-rc")):
+    if os.path.isdir(os.path.join(root, "claude_rc")):
+        sys.path.insert(0, root)
+        break
+
+from claude_rc.cli import main  # noqa: E402
+
+sys.exit(main())

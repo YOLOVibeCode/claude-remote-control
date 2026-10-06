@@ -29,7 +29,23 @@ claude() {
   local base name i=2
   base=$(basename "$PWD" | tr -c 'A-Za-z0-9_\n-' '-')
   name=$base
-  while tmux has-session -t "=$name" 2>/dev/null; do name=$base-$i; i=$((i+1)); done
+  # A name pinned in the claude-rc manifest is taken even while its tmux session is down
+  # (after a reboot, before the watchdog brings it back), so its conversation is never overwritten.
+  while tmux has-session -t "=$name" 2>/dev/null \
+        || { command -v claude-rc >/dev/null 2>&1 && claude-rc has "$name" 2>/dev/null; }; do
+    name=$base-$i; i=$((i+1))
+  done
+  # Pin a new conversation to a known id so a restart can --resume exactly this chat.
+  # Resuming or naming a conversation yourself (-r, -c, --session-id, ...) is left alone.
+  local pin=yes sid=""
+  for a in "$@"; do
+    case $a in -r|--resume|--resume=*|-c|--continue|--session-id|--session-id=*|--fork-session) pin="" ;; esac
+  done
+  if [ -n "$pin" ] && command -v uuidgen >/dev/null 2>&1; then
+    sid=$(uuidgen | tr 'A-Z' 'a-z')
+    command -v claude-rc >/dev/null 2>&1 && claude-rc pin "$name" "$PWD" "$sid" -- "$@" >/dev/null 2>&1
+    set -- --session-id "$sid" "$@"
+  fi
   # Remote Control lets the Claude app / claude.ai/code drive the same session, under the same name.
   local rc="--remote-control"
   for a in "$@"; do
