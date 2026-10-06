@@ -85,7 +85,8 @@ class App:
     # --- helpers ----------------------------------------------------------------------------
     def log(self, line: str) -> None:
         os.makedirs(self.home, mode=0o700, exist_ok=True)
-        with open(os.path.join(self.home, "watch.log"), "a") as f:
+        fd = os.open(os.path.join(self.home, "watch.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(self.clock.now()))} {line}\n")
 
     @contextlib.contextmanager

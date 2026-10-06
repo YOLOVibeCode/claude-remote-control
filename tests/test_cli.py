@@ -179,6 +179,13 @@ class AppTest(unittest.TestCase):
         with open(os.path.join(self.home, "watch.log")) as f:
             self.assertIn("restarted app", f.read())
 
+    def test_the_log_is_private(self):
+        import stat
+        self.pin_app()
+        self.app().watch()
+        mode = stat.S_IMODE(os.stat(os.path.join(self.home, "watch.log")).st_mode)
+        self.assertEqual(mode, 0o600)
+
     # check / report --------------------------------------------------------------------------
     def test_check_exits_nonzero_when_something_is_wrong_and_prints_json(self):
         self.pin_app()
