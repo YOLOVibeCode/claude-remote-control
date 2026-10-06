@@ -228,3 +228,25 @@ def format_report(rows: List[ReportRow]) -> Tuple[str, str]:
         f"{cells}</table>"
     )
     return subject, html
+
+
+# --- seeding the manifest ----------------------------------------------------------------
+
+def adopt(entries: List[Entry], records: List[Record], default_flags: Tuple[str, ...]) -> Tuple[List[Entry], List[str]]:
+    """Add live tmux hosts the manifest does not know yet. Never rewrites an existing entry;
+    notes when a host runs a different conversation than the one pinned."""
+    by_name = {e.name: e for e in entries}
+    out = list(entries)
+    notes: List[str] = []
+    for r in records:
+        if not r.alive or not r.tmux_session:
+            continue
+        known = by_name.get(r.tmux_session)
+        if known is None:
+            e = Entry(r.tmux_session, r.cwd, r.conversation, tuple(default_flags))
+            out.append(e)
+            by_name[e.name] = e
+            notes.append(f"added {e.name}")
+        elif known.conversation != r.conversation:
+            notes.append(f"{known.name} runs {r.conversation[:8]}, manifest pins {known.conversation[:8]}")
+    return out, notes
