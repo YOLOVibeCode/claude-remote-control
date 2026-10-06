@@ -13,6 +13,7 @@ from claude_rc.core import (  # noqa: E402
     Record,
     State,
     classify,
+    input_is_empty,
     restart_argv,
 )
 
@@ -84,6 +85,38 @@ class RestartArgvTest(unittest.TestCase):
     def test_per_session_flags_are_kept_in_order(self):
         e = entry(flags=("--model", "opus"))
         self.assertEqual(restart_argv(e, "/bin/claude")[-2:], ["--model", "opus"])
+
+
+class InputIsEmptyTest(unittest.TestCase):
+    """Captured with `tmux capture-pane -p -e` from real Claude Code 2.1.289/2.1.291 panes."""
+
+    PANE = "⏺ done\n\n────\n{line}\n────\n  ⏵⏵ bypass permissions on\n"
+
+    def pane(self, line):
+        return self.PANE.format(line=line)
+
+    def test_an_empty_input_box(self):
+        self.assertTrue(input_is_empty(self.pane("\x1b[39m❯\xa0")))
+
+    def test_a_dim_suggestion_is_still_empty(self):
+        self.assertTrue(input_is_empty(self.pane("\x1b[39m❯\xa0\x1b[2mpromote develop to main\x1b[0m")))
+
+    def test_a_typed_draft_is_not_empty(self):
+        self.assertFalse(input_is_empty(self.pane("\x1b[39m❯\xa0mzbm")))
+        self.assertFalse(input_is_empty(self.pane("\x1b[39m❯\xa0I want you to understand the nature of this application.")))
+
+    def test_a_draft_followed_by_an_autocomplete_hint_is_not_empty(self):
+        self.assertFalse(input_is_empty(self.pane("\x1b[39m❯\xa0prom\x1b[2mote develop to main\x1b[0m")))
+
+    def test_only_the_last_prompt_line_counts(self):
+        pane = "❯ an earlier message\n⏺ reply\n" + self.pane("\x1b[39m❯\xa0")
+        self.assertTrue(input_is_empty(pane))
+
+    def test_a_menu_cursor_is_not_an_input_box(self):
+        self.assertFalse(input_is_empty(" Quick safety check\n ❯ No, exit\n   Yes, I trust this folder\n"))
+
+    def test_no_prompt_at_all_is_not_safe_to_type_into(self):
+        self.assertFalse(input_is_empty("$ \n"))
 
 
 if __name__ == "__main__":

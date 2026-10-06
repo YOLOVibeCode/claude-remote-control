@@ -35,5 +35,6 @@ class TmuxMultiplexer:
         self._run(self._cmd("send-keys", "-t", f"={name}:", "-l", text))
         self._run(self._cmd("send-keys", "-t", f"={name}:", "Enter"))
 
-    def capture(self, name: str, lines: int) -> str:
-        return self._run(self._cmd("capture-pane", "-p", "-t", f"={name}:", "-S", f"-{lines}"))[1]
+    def capture(self, name: str, lines: int, ansi: bool = False) -> str:
+        style = ("-e",) if ansi else ()
+        return self._run(self._cmd("capture-pane", "-p", *style, "-t", f"={name}:", "-S", f"-{lines}"))[1]

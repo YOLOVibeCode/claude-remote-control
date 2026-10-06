@@ -44,8 +44,10 @@ class FakeMux:
     def send_keys(self, name, text):
         self.calls.append(("keys", name, text))
 
-    def capture(self, name, lines):
-        return "Workspace not trusted\n"
+    pane = "\x1b[39m❯\xa0\n"
+
+    def capture(self, name, lines, ansi=False):
+        return self.pane if ansi else "Workspace not trusted\n"
 
 
 class Clock:
@@ -166,6 +168,22 @@ class AppTest(unittest.TestCase):
         self.app().watch()
         self.assertEqual(len([c for c in self.mux.calls if c[0] == "keys"]), 1)
         self.assertIn("needs you app (Remote Control still off after relink)", self.text.sent[-1][1])
+
+    def test_relink_never_types_over_a_draft(self):
+        self.pin_app()
+        self.mux.sessions.add("app")
+        self.mux.pane = "\x1b[39m❯\xa0half-written thought\n"
+        self.reg.records = [Record(1, CONV, "/w/app", "app", "idle", False, "2.1.291", True)]
+        for _ in range(3):
+            self.app().watch()
+            self.clock.t += 600
+        self.assertEqual([c for c in self.mux.calls if c[0] == "keys"], [])
+        with open(os.path.join(self.home, "watch.log")) as f:
+            self.assertIn("relink skipped for app: text in its input box", f.read())
+        # Once the draft is gone, the relink happens.
+        self.mux.pane = "\x1b[39m❯\xa0\n"
+        self.app().watch()
+        self.assertEqual([c for c in self.mux.calls if c[0] == "keys"], [("keys", "app", "/remote-control")])
 
     def test_failed_delivery_is_queued_and_sent_next_run(self):
         self.pin_app()

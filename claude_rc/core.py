@@ -256,3 +256,32 @@ def adopt(entries: List[Entry], records: List[Record], default_flags: Tuple[str,
         elif known.conversation != r.conversation:
             notes.append(f"{known.name} runs {r.conversation[:8]}, manifest pins {known.conversation[:8]}")
     return out, notes
+
+
+# --- is it safe to type into a session? ------------------------------------------------------
+
+_DIM = "\x1b[2m"
+_PROMPT = "❯"  # ❯
+
+
+def input_is_empty(pane_ansi: str) -> bool:
+    """True only when Claude Code's input box is empty (a dim suggestion counts as empty).
+
+    `pane_ansi` is `tmux capture-pane -p -e`. The input box is the last line that starts with
+    ❯ followed by a non-breaking space; text after it that is not dimmed is a draft. A menu
+    cursor (`❯ No, exit`) or anything unrecognised is treated as not empty: never type blind.
+    """
+    import re
+
+    lines = [l for l in pane_ansi.split("\n") if _PROMPT in l]
+    if not lines:
+        return False
+    line = lines[-1]
+    after = line.split(_PROMPT, 1)[1]
+    if not after.startswith("\xa0"):
+        return False  # a regular space: a selection menu, not the input box
+    after = after[1:]
+    # Everything from the first dim marker on is a suggestion/hint, not typed text.
+    typed = after.split(_DIM, 1)[0]
+    typed = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", typed)
+    return typed.strip(" \xa0\t") == ""
