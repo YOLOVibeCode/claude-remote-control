@@ -149,3 +149,82 @@ def plan(observations: List[Observation], histories: Dict[str, History], now: fl
         conditions[name] = condition
         out[name] = History(restarts=recent, last_state=last, idle_unlinked_runs=idle_runs, relinked_at=relinked_at)
     return Decision(tuple(actions), conditions, out)
+
+
+# --- what reaches the phone and the inbox --------------------------------------------
+
+SMS_LIMIT = 300
+
+REASONS = {
+    "NOT_RUNNING": "claude not running in its tmux session",
+    "WRONG_CONVERSATION": "wrong conversation",
+    "RESTART_FAILED": "restart failed",
+    "GAVE_UP": "gave up after 3 restarts this hour",
+    "UNLINKED_STUCK": "Remote Control still off after relink",
+}
+
+
+def diff_alerts(prev: Dict[str, str], now: Dict[str, str]) -> Optional[str]:
+    """One message per change: restarts, new problems, recoveries. None when nothing changed."""
+    restarted = [n for n, c in now.items() if c == "RESTARTED" and prev.get(n) != "RESTARTED"]
+    trouble = [f"{n} ({REASONS[c]})" for n, c in now.items() if c in NEEDS_YOU and prev.get(n) != c]
+    back = [n for n, c in now.items() if c == "OK" and (prev.get(n) in NEEDS_YOU or prev.get(n) in ("RESTARTED", "STARTING"))]
+    groups = [("restarted", restarted), ("needs you", trouble), ("back", back)]
+    if not any(items for _, items in groups):
+        return None
+    return _fit("claude-rc: ", groups, SMS_LIMIT)
+
+
+def _fit(prefix: str, groups: List[Tuple[str, List[str]]], limit: int) -> str:
+    total = sum(len(items) for _, items in groups)
+    shown: List[Tuple[str, List[str]]] = []
+    used = 0
+
+    def render(gs: List[Tuple[str, List[str]]], left: int) -> str:
+        body = "; ".join(f"{label} {', '.join(items)}" for label, items in gs if items)
+        return prefix + body + (f" +{left} more" if left else "")
+
+    for label, items in groups:
+        kept: List[str] = []
+        for item in items:
+            trial = shown + [(label, kept + [item])]
+            if len(render(trial, total - used - 1)) > limit:
+                return render(shown + [(label, kept)], total - used)
+            kept.append(item)
+            used += 1
+        shown.append((label, kept))
+    return render(shown, 0)
+
+
+@dataclass(frozen=True)
+class ReportRow:
+    name: str
+    condition: str
+    conversation: str
+    linked: bool
+    version: str
+    restarts_24h: int
+    dir: str
+
+
+def format_report(rows: List[ReportRow]) -> Tuple[str, str]:
+    """Daily all-clear email: (subject, html)."""
+    from html import escape
+
+    ok = sum(1 for r in rows if r.condition == "OK")
+    need = sum(1 for r in rows if r.condition in NEEDS_YOU)
+    subject = f"claude-rc: {ok}/{len(rows)} OK" + (f", {need} need you" if need else "")
+    cells = "".join(
+        "<tr>"
+        f"<td>{escape(r.name)}</td><td>{escape(r.condition)}</td><td><code>{escape(r.conversation[:8])}</code></td>"
+        f"<td>{'yes' if r.linked else 'no'}</td><td>{escape(r.version)}</td><td>{r.restarts_24h}</td><td>{escape(r.dir)}</td>"
+        "</tr>"
+        for r in sorted(rows, key=lambda r: (r.condition not in NEEDS_YOU, r.condition != "OK", r.name))
+    )
+    html = (
+        f"<p>{escape(subject)}</p>"
+        "<table border='1' cellpadding='4' cellspacing='0'>"
+        "<tr><th>session</th><th>state</th><th>conversation</th><th>linked</th><th>CLI</th><th>restarts 24h</th><th>folder</th></tr>"
+        f"{cells}</table>"
+    )
+    return subject, html
