@@ -24,9 +24,9 @@ NOW = 1_000_000.0
 BIN = "/bin/claude"
 
 
-def obs(state: State, status: str | None = "idle", name: str = "app", enabled: bool = True) -> Observation:
+def obs(state: State, status: str | None = "idle", name: str = "app", enabled: bool = True, trusted: bool = True) -> Observation:
     e = Entry(name=name, dir=f"/w/{name}", conversation=CONV, flags=("--dangerously-skip-permissions",), enabled=enabled)
-    return Observation(entry=e, state=state, status=status)
+    return Observation(entry=e, state=state, status=status, trusted=trusted)
 
 
 class PlanTest(unittest.TestCase):
@@ -63,6 +63,17 @@ class PlanTest(unittest.TestCase):
         d = self.run_plan(obs(State.DEAD), histories=h)
         self.assertEqual(len(d.actions), 1)
         self.assertEqual(d.histories["app"].restarts, (NOW,))
+
+    def test_a_dead_host_in_an_untrusted_folder_is_not_restarted(self):
+        # claude would stop at "Do you trust this folder?" and never register.
+        d = self.run_plan(obs(State.DEAD, status=None, trusted=False))
+        self.assertEqual(d.actions, ())
+        self.assertEqual(d.conditions["app"], "UNTRUSTED")
+        self.assertIn("UNTRUSTED", NEEDS_YOU)
+
+    def test_an_untrusted_folder_does_not_matter_while_the_host_runs(self):
+        d = self.run_plan(obs(State.OK, trusted=False))
+        self.assertEqual(d.conditions["app"], "OK")
 
     def test_restart_failed_is_reported_not_retried(self):
         d = self.run_plan(obs(State.RESTART_FAILED, status=None))

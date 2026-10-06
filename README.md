@@ -91,7 +91,10 @@ it. Each manifest line holds `name`, `dir`, `conversation`, `flags` (reused on r
 **States.** `OK` alive on its conversation and linked. `DEAD` no tmux session: restarted (3 an
 hour at most, then `GAVE_UP`). `UNLINKED` Remote Control dropped: when the session is idle for
 two runs, `/remote-control` is typed into it once (`UNLINKED_STUCK` if that did not work).
-`WRONG_CONVERSATION` and `NOT_RUNNING` are reported and never touched. `RESTART_FAILED` means a
+`WRONG_CONVERSATION` and `NOT_RUNNING` are reported and never touched. `UNTRUSTED`: a dead
+session whose folder Claude Code does not trust is not restarted, because claude would stop at
+the trust prompt; open claude in that folder once and accept (your home folder cannot be
+trusted, so keep supervised sessions in project folders). `check` and the report flag these. `RESTART_FAILED` means a
 restart never registered; the pane's last lines go to `~/.config/claude-rc/watch.log`.
 
 **Alerts and the daily report** go through pluggable providers, chosen per channel in

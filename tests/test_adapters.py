@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from claude_rc.adapters.files import JsonManifestStore, JsonStateStore  # noqa: E402
 from claude_rc.adapters.registry import FileSessionRegistry  # noqa: E402
 from claude_rc.adapters.tmux import TmuxMultiplexer  # noqa: E402
+from claude_rc.adapters.trust import ClaudeJsonTrust  # noqa: E402
 from claude_rc.core import Entry, History, Record, State, adopt  # noqa: E402
 
 CONV = "11111111-1111-1111-1111-111111111111"
@@ -69,6 +70,21 @@ class RegistryTest(unittest.TestCase):
         open(os.path.join(self.dir, "10.abc.key"), "w").write("secret")
         reg = FileSessionRegistry(self.dir, pid_alive=lambda pid: True)
         self.assertEqual([r.pid for r in reg.live_sessions()], [10])
+
+
+class TrustTest(unittest.TestCase):
+    def test_reads_the_trust_flag_per_folder_from_claude_json(self):
+        p = os.path.join(tempfile.mkdtemp(), ".claude.json")
+        with open(p, "w") as f:
+            json.dump({"projects": {"/w/ok": {"hasTrustDialogAccepted": True}, "/w/no": {"hasTrustDialogAccepted": False}},
+                       "oauthAccount": {"token": "never-read"}}, f)
+        t = ClaudeJsonTrust(p)
+        self.assertTrue(t.trusted("/w/ok"))
+        self.assertFalse(t.trusted("/w/no"))
+        self.assertFalse(t.trusted("/w/unknown"))
+
+    def test_a_missing_file_trusts_everything_rather_than_blocking_restarts(self):
+        self.assertTrue(ClaudeJsonTrust("/nonexistent/.claude.json").trusted("/w/x"))
 
 
 class FilesTest(unittest.TestCase):

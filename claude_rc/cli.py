@@ -78,8 +78,10 @@ def flags_to_record(args: Sequence[str]) -> Tuple[str, ...]:
 
 class App:
     def __init__(self, home: str, registry, mux, manifest, state, clock, claude_bin: str,
-                 text: Channel, mail: Channel, out: TextIO = sys.stdout, sleep: Callable[[float], None] = time.sleep):
+                 text: Channel, mail: Channel, out: TextIO = sys.stdout, sleep: Callable[[float], None] = time.sleep,
+                 trust=None):
         self.home, self.registry, self.mux, self.manifest, self.state = home, registry, mux, manifest, state
+        self.trust = trust
         self.clock, self.claude_bin, self.text, self.mail, self.out, self.sleep = clock, claude_bin, text, mail, out, sleep
 
     # --- helpers ----------------------------------------------------------------------------
@@ -121,7 +123,8 @@ class App:
         for e in entries:
             r = recs.get(e.name)
             state = classify(e, self.mux.has_session(e.name), r, histories.get(e.name, History()), now)
-            rows.append((Observation(e, state, r.status if r and r.alive else None), r))
+            trusted = self.trust.trusted(e.dir) if self.trust is not None else True
+            rows.append((Observation(e, state, r.status if r and r.alive else None, trusted), r))
         return rows
 
     # --- commands ---------------------------------------------------------------------------
@@ -168,7 +171,8 @@ class App:
         _, histories, _ = self.state.load()
         rows = self._observe(self.manifest.load(), histories)
         data = [{"name": o.entry.name, "state": o.state.value, "conversation": o.entry.conversation,
-                 "linked": bool(r and r.linked), "status": o.status, "version": r.version if r else None}
+                 "linked": bool(r and r.linked), "status": o.status, "version": r.version if r else None,
+                 "trusted": o.trusted}
                 for o, r in rows]
         if as_json:
             json.dump(data, self.out, indent=2)
@@ -176,7 +180,8 @@ class App:
         else:
             for d in data:
                 print(f"{d['state']:<19} {d['name']:<24} {d['conversation'][:8]}  "
-                      f"{'linked' if d['linked'] else 'no-link'}  {d['status'] or '-'}", file=self.out)
+                      f"{'linked' if d['linked'] else 'no-link'}  {d['status'] or '-'}"
+                      f"{'' if d['trusted'] else '  (folder not trusted: restart would stop at the prompt)'}", file=self.out)
         fine = {State.OK, State.DISABLED, State.STARTING}
         return 0 if all(o.state in fine for o, _ in rows) else 1
 
@@ -262,7 +267,8 @@ class App:
         for o, r in self._observe(self.manifest.load(), histories):
             h = histories.get(o.entry.name, History())
             rows.append(ReportRow(o.entry.name, o.state.value, o.entry.conversation, bool(r and r.linked),
-                                  r.version if r else "-", sum(1 for t in h.restarts if now - t < 86400), o.entry.dir))
+                                  r.version if r else "-", sum(1 for t in h.restarts if now - t < 86400), o.entry.dir,
+                                  o.trusted))
         subject, html = format_report(rows)
         channel = self.mail()
         if channel is None:
@@ -324,6 +330,7 @@ def build_app(home: Optional[str] = None) -> App:
     from .adapters.files import JsonManifestStore, JsonStateStore, read_json
     from .adapters.registry import FileSessionRegistry
     from .adapters.tmux import TmuxMultiplexer
+    from .adapters.trust import ClaudeJsonTrust
     from .notify import ConfigError, build_email_sender, build_text_sender
 
     home = home or os.environ.get("CLAUDE_RC_HOME") or os.path.expanduser("~/.config/claude-rc")
@@ -351,7 +358,8 @@ def build_app(home: Optional[str] = None) -> App:
     return App(home=home, registry=FileSessionRegistry(registry_dir), mux=TmuxMultiplexer(),
                manifest=JsonManifestStore(os.path.join(home, "sessions.json")),
                state=JsonStateStore(os.path.join(home, "state.json")), clock=_Clock(), claude_bin=_claude_bin(),
-               text=channel("alerts", build_text_sender), mail=channel("report", build_email_sender))
+               text=channel("alerts", build_text_sender), mail=channel("report", build_email_sender),
+               trust=ClaudeJsonTrust())
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

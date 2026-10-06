@@ -32,6 +32,10 @@ class StateStore(Protocol):
     def save(self, conditions: Dict[str, str], histories: Dict[str, History], queued: List[str]) -> None: ...
 
 
+class TrustSource(Protocol):
+    def trusted(self, directory: str) -> bool: ...
+
+
 class Clock(Protocol):
     def now(self) -> float: ...
 

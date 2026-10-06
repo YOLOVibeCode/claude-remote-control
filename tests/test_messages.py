@@ -39,6 +39,12 @@ class DiffAlertsTest(unittest.TestCase):
             "claude-rc: needs you a (gave up after 3 restarts this hour)",
         )
 
+    def test_untrusted_alert_says_how_to_fix_it(self):
+        self.assertEqual(
+            diff_alerts({"admin": "OK"}, {"admin": "UNTRUSTED"}),
+            "claude-rc: needs you admin (folder not trusted: open claude there once and accept)",
+        )
+
     def test_recovery_from_a_problem_is_reported(self):
         self.assertEqual(diff_alerts({"a": "UNLINKED_STUCK"}, {"a": "OK"}), "claude-rc: back a")
 
@@ -61,8 +67,9 @@ class DiffAlertsTest(unittest.TestCase):
 
 
 class FormatReportTest(unittest.TestCase):
-    def row(self, name, condition, linked=True):
-        return ReportRow(name=name, condition=condition, conversation=CONV, linked=linked, version="2.1.291", restarts_24h=0, dir=f"/w/{name}")
+    def row(self, name, condition, linked=True, trusted=True):
+        return ReportRow(name=name, condition=condition, conversation=CONV, linked=linked, version="2.1.291",
+                         restarts_24h=0, dir=f"/w/{name}", trusted=trusted)
 
     def test_all_clear_subject(self):
         subject, html = format_report([self.row("a", "OK"), self.row("b", "OK")])
@@ -72,6 +79,10 @@ class FormatReportTest(unittest.TestCase):
     def test_subject_counts_what_needs_you(self):
         subject, _ = format_report([self.row("a", "OK"), self.row("b", "WRONG_CONVERSATION"), self.row("c", "GAVE_UP"), self.row("d", "UNLINKED", linked=False)])
         self.assertEqual(subject, "claude-rc: 1/4 OK, 2 need you")
+
+    def test_untrusted_folders_are_flagged_in_the_report(self):
+        _, html = format_report([self.row("admin", "OK", trusted=False)])
+        self.assertIn("not trusted", html)
 
     def test_names_are_escaped(self):
         _, html = format_report([self.row("<b>x</b>", "OK")])

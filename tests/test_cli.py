@@ -81,9 +81,18 @@ class AppTest(unittest.TestCase):
         self.out = io.StringIO()
         self.manifest = JsonManifestStore(os.path.join(self.home, "sessions.json"))
         self.state = JsonStateStore(os.path.join(self.home, "state.json"))
+        self.untrusted = set()
+        outer = self
+
+        class Trust:
+            def trusted(self, d):
+                return d not in outer.untrusted
+
+        self.trust = Trust()
 
     def app(self, **kw):
         base = dict(home=self.home, registry=self.reg, mux=self.mux, manifest=self.manifest, state=self.state,
+                    trust=self.trust,
                     clock=self.clock, claude_bin=BIN, text=lambda: (self.text, "+15125550100"),
                     mail=lambda: (self.mail, "me@example.com"), out=self.out, sleep=lambda s: None)
         base.update(kw)
@@ -122,6 +131,19 @@ class AppTest(unittest.TestCase):
         self.clock.t += 600
         self.app().watch()
         self.assertEqual(len(self.text.sent), 2)  # stable: silent
+
+    def test_watch_does_not_restart_into_an_untrusted_folder(self):
+        self.pin_app()
+        self.untrusted.add("/w/app")
+        self.app().watch()
+        self.assertEqual(self.mux.calls, [])
+        self.assertIn("needs you app (folder not trusted", self.text.sent[-1][1])
+
+    def test_check_json_shows_trust(self):
+        self.pin_app()
+        self.untrusted.add("/w/app")
+        self.app().check(as_json=True)
+        self.assertFalse(json.loads(self.out.getvalue())[0]["trusted"])
 
     def test_a_restart_that_never_registers_is_reported_with_the_pane(self):
         self.pin_app()

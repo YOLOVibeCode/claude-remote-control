@@ -88,7 +88,7 @@ MAX_RESTARTS_PER_HOUR = 3
 RELINK_AFTER_IDLE_RUNS = 2
 
 # Conditions a person has to look at; everything else is fine or being handled.
-NEEDS_YOU = frozenset({"NOT_RUNNING", "WRONG_CONVERSATION", "RESTART_FAILED", "GAVE_UP", "UNLINKED_STUCK"})
+NEEDS_YOU = frozenset({"NOT_RUNNING", "WRONG_CONVERSATION", "RESTART_FAILED", "GAVE_UP", "UNLINKED_STUCK", "UNTRUSTED"})
 
 
 @dataclass(frozen=True)
@@ -96,6 +96,7 @@ class Observation:
     entry: Entry
     state: State
     status: Optional[str]  # registry status of the live process (idle | busy | shell), if any
+    trusted: bool = True   # Claude Code trusts entry.dir; if not, a restart stops at the trust prompt
 
 
 @dataclass(frozen=True)
@@ -129,7 +130,9 @@ def plan(observations: List[Observation], histories: Dict[str, History], now: fl
         idle_runs, relinked_at, last = h.idle_unlinked_runs, h.relinked_at, o.state
         condition = o.state.value
 
-        if o.state is State.DEAD:
+        if o.state is State.DEAD and not o.trusted:
+            condition = "UNTRUSTED"
+        elif o.state is State.DEAD:
             if len(recent) < MAX_RESTARTS_PER_HOUR:
                 actions.append(Restart(name, o.entry.dir, tuple(restart_argv(o.entry, claude_bin))))
                 recent = recent + (now,)
@@ -161,6 +164,7 @@ REASONS = {
     "RESTART_FAILED": "restart failed",
     "GAVE_UP": "gave up after 3 restarts this hour",
     "UNLINKED_STUCK": "Remote Control still off after relink",
+    "UNTRUSTED": "folder not trusted: open claude there once and accept",
 }
 
 
@@ -205,6 +209,7 @@ class ReportRow:
     version: str
     restarts_24h: int
     dir: str
+    trusted: bool = True
 
 
 def format_report(rows: List[ReportRow]) -> Tuple[str, str]:
@@ -217,7 +222,8 @@ def format_report(rows: List[ReportRow]) -> Tuple[str, str]:
     cells = "".join(
         "<tr>"
         f"<td>{escape(r.name)}</td><td>{escape(r.condition)}</td><td><code>{escape(r.conversation[:8])}</code></td>"
-        f"<td>{'yes' if r.linked else 'no'}</td><td>{escape(r.version)}</td><td>{r.restarts_24h}</td><td>{escape(r.dir)}</td>"
+        f"<td>{'yes' if r.linked else 'no'}</td><td>{escape(r.version)}</td><td>{r.restarts_24h}</td>"
+        f"<td>{escape(r.dir)}{'' if r.trusted else ' <b>(not trusted: a restart would stop at the trust prompt)</b>'}</td>"
         "</tr>"
         for r in sorted(rows, key=lambda r: (r.condition not in NEEDS_YOU, r.condition != "OK", r.name))
     )
