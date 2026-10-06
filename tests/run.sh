@@ -27,7 +27,19 @@ cat > "$work/bin/claude" <<'EOF'
 #!/bin/sh
 echo "claude-direct $*" >> "$LOG"
 EOF
-chmod +x "$work/bin/tmux" "$work/bin/claude"
+cat > "$work/bin/claude-rc" <<'EOF'
+#!/bin/sh
+echo "claude-rc $*" >> "$LOG"
+case "$1" in
+  has) for r in $RESERVED; do [ "$r" = "$2" ] && exit 0; done; exit 1 ;;
+esac
+exit 0
+EOF
+cat > "$work/bin/uuidgen" <<'EOF'
+#!/bin/sh
+echo "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+EOF
+chmod +x "$work/bin/tmux" "$work/bin/claude" "$work/bin/claude-rc" "$work/bin/uuidgen"
 
 # The wrapper only takes over on a real terminal, so run each case on a pseudo-terminal.
 # Python's pty module gives the child a tty on stdin/stdout without forwarding our stdin;
@@ -54,7 +66,7 @@ run_case() {  # run_case <shell> <dir> <claude args...>
   in_pty "$sh" "unset TMUX SSH_CONNECTION; export PATH=\"$work/bin:\$PATH\"; . \"$root/shell/claude-tmux.sh\"; cd \"$dir\" && claude $*"
 }
 
-export LOG="$work/log" EXIST=""
+export LOG="$work/log" EXIST="" RESERVED=""
 mkdir -p "$work/my-app" "$work/weird name!"
 
 shells="bash"
@@ -83,23 +95,39 @@ for sh in $shells; do
 
   run_case "$sh" "$work/my-app"
   check  "plain claude opens a tmux session named after the folder" 'tmux new-session -s my-app -c .*/my-app '
-  check  "...with Remote Control on under the same name"            'claude --remote-control my-app$'
+  check  "...with Remote Control on under the same name"            'claude --remote-control my-app --session-id aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee$'
+  check  "a new session is pinned to a fresh conversation id"       'claude-rc pin my-app .*/my-app aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee --$'
 
   run_case "$sh" "$work/my-app" --dangerously-skip-permissions
-  check  "cc's flag is passed through after the name" 'claude --remote-control my-app --dangerously-skip-permissions$'
+  check  "cc's flag is passed through after the pin" 'claude --remote-control my-app --session-id aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee --dangerously-skip-permissions$'
+  check  "...and recorded with the pin"             'claude-rc pin my-app .*/my-app aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee -- --dangerously-skip-permissions$'
 
   EXIST="my-app" run_case "$sh" "$work/my-app"
-  check  "a taken name gets a -2 suffix" 'new-session -s my-app-2 .*--remote-control my-app-2$'
+  check  "a taken name gets a -2 suffix" 'new-session -s my-app-2 .*--remote-control my-app-2 '
 
   EXIST="my-app my-app-2" run_case "$sh" "$work/my-app"
   check  "...and -3 after that" 'new-session -s my-app-3 '
 
   run_case "$sh" "$work/my-app" --remote-control mine
-  check  "an explicit --remote-control is kept" 'new-session -s my-app .* claude --remote-control mine$'
+  check  "an explicit --remote-control is kept" 'new-session -s my-app .* claude --session-id aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee --remote-control mine$'
   refute "...and not doubled"                   'remote-control my-app'
 
   run_case "$sh" "$work/weird name!"
   check  "odd folder names become safe session names" 'new-session -s weird-name- '
+
+  RESERVED="my-app" run_case "$sh" "$work/my-app"
+  check  "a name pinned in the manifest counts as taken" 'new-session -s my-app-2 '
+  refute "...so its pinned conversation is not overwritten" 'claude-rc pin my-app '
+
+  run_case "$sh" "$work/my-app" --resume 1234
+  check  "--resume is not pinned again"   'claude --remote-control my-app --resume 1234$'
+  refute "...and nothing is recorded"     'claude-rc pin'
+
+  run_case "$sh" "$work/my-app" -c
+  refute "-c is not pinned"               'session-id'
+
+  run_case "$sh" "$work/my-app" --session-id 9999
+  check  "an explicit --session-id is kept as given" 'claude --remote-control my-app --session-id 9999$'
 
   run_case "$sh" "$work/my-app" -p hello
   check  "print mode bypasses tmux" '^claude-direct -p hello$'
@@ -150,6 +178,14 @@ grep -q 'export FOO=1' "$H/.zshrc" && ok "--uninstall keeps the rest of .zshrc" 
 printf 'alias cc="claude --model opus"\n' > "$H/.zshrc"
 inst
 [ "$(grep -c '^alias cc=' "$H/.zshrc")" = 1 ] && ok "an existing cc alias is left alone" || bad "an existing cc alias is left alone"
+
+echo "claude-rc (python unittest)"
+py=/usr/bin/python3; [ -x "$py" ] || py=python3   # launchd runs the system python; test with it
+if out=$(cd "$root" && "$py" -m unittest discover -s tests -p 'test_*.py' 2>&1 >/dev/null); then
+  ok "$(printf '%s\n' "$out" | grep -E '^Ran ' | head -1)"
+else
+  bad "python unittest" "$(printf '%s\n' "$out" | tail -15 | tr '\n' '|')"
+fi
 
 echo
 echo "$pass passed, $fail failed"
