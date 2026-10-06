@@ -154,9 +154,11 @@ If Remote Control is ever off, for example in a session you started some other w
 
 On your phone, open the **Claude app**, tap **Code**, and find `my-app` in the session list. Remote Control sessions show a computer icon with a **green dot** when they're online.
 
-> 📱 **[Screenshot A: the Claude app's Code tab, with `my-app` and its green dot]**
->
-> 📱 **[Screenshot B: the `my-app` session open on the phone, mid-conversation]**
+![The session list at claude.ai/code on a phone-sized screen, with my-app at the top of Recents (other sessions blurred)](docs/images/phone-a-session-list.png)
+
+Tap it, and you're in the same conversation. I typed this message on the phone. Claude ran `hello.sh` on the Mac, and the reply showed up in both places:
+
+![The my-app session on the phone: the prompt typed there, the commands run on the Mac, and "Hello from my Mac" in the reply](docs/images/phone-b-session.png)
 
 Prefer a QR code? In the terminal, type `/remote-control` again to open the status panel, then pick **Show QR code**:
 
@@ -189,7 +191,9 @@ It runs in a background tmux session called `remote`. Attach with `tmux attach -
 
 Now your Mac shows up in the Claude app as an environment named after its hostname. New sessions you start there run on the Mac, up to 32 at once. Restart it with `ccserve restart` and stop it with `tmux kill-session -t remote`.
 
-> 📱 **[Screenshot C: picking the Mac's environment when you start a new session in the app]**
+To use it, start a new session, open the environment menu and pick **Remote Control**. Your Mac is listed by hostname, with the folder the server runs in:
+
+![New session → Remote Control → NSOSXAI → Dev, 1 running](docs/images/phone-c-environment.png)
 
 ## Step 8 (optional): Plan B, SSH straight into the same terminal
 
@@ -202,8 +206,6 @@ Sometimes you want the raw terminal: a full-screen TUI, a stuck prompt, or a qui
 ![cpick lists tmux sessions newest first with their current task: blog, api-server, my-app. Number to attach, n = new claude, Enter = shell](docs/images/05-cpick.png)
 
 Type a number to attach. You're now in the same Claude Code session that's on your Mac screen and in the Claude app. Detach with **Ctrl-b d** and the session keeps running. `NOMENU=1` skips the menu, and you can run `cpick` by hand whenever you like.
-
-> 📱 **[Screenshot D: Termius on the phone, attached to `my-app` with the tmux status bar visible]**
 
 ---
 
