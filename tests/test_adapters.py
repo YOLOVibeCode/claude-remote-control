@@ -143,6 +143,10 @@ class TmuxTest(unittest.TestCase):
         self.assertEqual(self.tmux.capture("Ava", 20), "pane text\n")
         self.assertEqual(self.calls[-1], ["tmux", "capture-pane", "-p", "-t", "=Ava:", "-S", "-20"])
 
+    def test_capture_can_keep_styles(self):
+        self.tmux.capture("Ava", 20, ansi=True)
+        self.assertEqual(self.calls[-1], ["tmux", "capture-pane", "-p", "-e", "-t", "=Ava:", "-S", "-20"])
+
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
 class RealTmuxTest(unittest.TestCase):

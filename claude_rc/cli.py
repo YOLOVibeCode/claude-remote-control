@@ -38,6 +38,7 @@ from .core import (
     adopt,
     classify,
     diff_alerts,
+    input_is_empty,
     format_report,
     plan,
 )
@@ -209,8 +210,14 @@ class App:
                     conditions[a.name] = "RESTART_FAILED"
                     self.log(f"restart {a.name} failed: {e}")
             elif isinstance(a, Relink):
-                self.mux.send_keys(a.name, "/remote-control")
-                self.log(f"relink: typed /remote-control into {a.name}")
+                # Never type over a draft or into a menu: Enter would submit the user's text.
+                if input_is_empty(self.mux.capture(a.name, 40, ansi=True)):
+                    self.mux.send_keys(a.name, "/remote-control")
+                    self.log(f"relink: typed /remote-control into {a.name}")
+                else:
+                    h = histories[a.name]
+                    histories[a.name] = History(h.restarts, h.last_state, h.idle_unlinked_runs, None)
+                    self.log(f"relink skipped for {a.name}: text in its input box")
 
         if restarted:
             self._await_restarts(restarted, entries, conditions, histories)
