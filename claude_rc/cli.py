@@ -39,6 +39,7 @@ from .core import (
     adopt,
     classify,
     diff_alerts,
+    diff_changes,
     input_is_empty,
     format_report,
     plan,
@@ -236,9 +237,11 @@ class App:
         if restarted:
             self._await_restarts(restarted, entries, conditions, histories)
 
+        change = diff_changes(prev, conditions)
+        if change:
+            self.log(change)
         msg = diff_alerts(prev, conditions)
         if msg:
-            self.log(msg)
             queued = queued + [msg]
         queued = self._deliver(queued)
         self.state.save(conditions, histories, queued[-QUEUE_LIMIT:])

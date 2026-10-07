@@ -134,18 +134,20 @@ class AppTest(unittest.TestCase):
         self.assertEqual(a.has("nope"), 1)
 
     # watch ----------------------------------------------------------------------------------
-    def test_watch_restarts_a_dead_host_and_reports_restart_then_return(self):
+    def test_watch_restarts_a_dead_host_and_logs_restart_then_return_without_texting(self):
         self.pin_app()
         self.app().watch()
         self.assertEqual(self.mux.calls[0], ("new", "app", "/w/app",
                                              (BIN, "--remote-control", "app", "--resume", CONV, "--dangerously-skip-permissions")))
-        self.assertEqual(self.text.sent, [("+15125550100", "claude-rc: restarted app")])
         self.clock.t += 600
         self.app().watch()
-        self.assertEqual(self.text.sent[-1], ("+15125550100", "claude-rc: back app"))
         self.clock.t += 600
         self.app().watch()
-        self.assertEqual(len(self.text.sent), 2)  # stable: silent
+        self.assertEqual(self.text.sent, [])  # it fixed itself: nothing for the phone
+        with open(os.path.join(self.home, "watch.log")) as f:
+            log = f.read()
+        self.assertIn("claude-rc: restarted app", log)
+        self.assertIn("claude-rc: back app", log)
 
     def test_watch_does_not_restart_into_an_untrusted_folder(self):
         self.pin_app()
@@ -200,6 +202,8 @@ class AppTest(unittest.TestCase):
 
     def test_failed_delivery_is_queued_and_sent_next_run(self):
         self.pin_app()
+        self.mux.sessions.add("app")
+        self.reg.records = [Record(1, "other-conv", "/w/app", "app", "idle", True, "2.1.291", True)]
         self.text.fail = True
         self.app().watch()
         self.assertEqual(self.text.sent, [])
@@ -207,7 +211,7 @@ class AppTest(unittest.TestCase):
         self.clock.t += 600
         self.app().watch()
         bodies = [b for _, b in self.text.sent]
-        self.assertEqual(bodies, ["claude-rc: restarted app", "claude-rc: back app"])
+        self.assertEqual(bodies, ["claude-rc: needs you app (wrong conversation)"])
 
     def test_wrong_conversation_is_reported_and_never_touched(self):
         self.pin_app()
