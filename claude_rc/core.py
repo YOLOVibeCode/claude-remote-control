@@ -168,15 +168,25 @@ REASONS = {
 }
 
 
-def diff_alerts(prev: Dict[str, str], now: Dict[str, str]) -> Optional[str]:
-    """One message per change: restarts, new problems, recoveries. None when nothing changed."""
+def _new_trouble(prev: Dict[str, str], now: Dict[str, str]) -> List[str]:
+    return [f"{n} ({REASONS[c]})" for n, c in now.items() if c in NEEDS_YOU and prev.get(n) != c]
+
+
+def diff_changes(prev: Dict[str, str], now: Dict[str, str]) -> Optional[str]:
+    """One line per run for watch.log: restarts, new problems, recoveries. None when nothing changed."""
     restarted = [n for n, c in now.items() if c == "RESTARTED" and prev.get(n) != "RESTARTED"]
-    trouble = [f"{n} ({REASONS[c]})" for n, c in now.items() if c in NEEDS_YOU and prev.get(n) != c]
     back = [n for n, c in now.items() if c == "OK" and (prev.get(n) in NEEDS_YOU or prev.get(n) in ("RESTARTED", "STARTING"))]
-    groups = [("restarted", restarted), ("needs you", trouble), ("back", back)]
+    groups = [("restarted", restarted), ("needs you", _new_trouble(prev, now)), ("back", back)]
     if not any(items for _, items in groups):
         return None
     return _fit("claude-rc: ", groups, SMS_LIMIT)
+
+
+def diff_alerts(prev: Dict[str, str], now: Dict[str, str]) -> Optional[str]:
+    """The text for the phone: only new problems that need you. Restarts that worked and recoveries
+    are in watch.log (diff_changes) and the daily report. None when nothing needs you."""
+    trouble = _new_trouble(prev, now)
+    return _fit("claude-rc: ", [("needs you", trouble)], SMS_LIMIT) if trouble else None
 
 
 def _fit(prefix: str, groups: List[Tuple[str, List[str]]], limit: int) -> str:

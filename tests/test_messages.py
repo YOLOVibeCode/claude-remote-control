@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from claude_rc.core import ReportRow, diff_alerts, format_report  # noqa: E402
+from claude_rc.core import ReportRow, diff_alerts, diff_changes, format_report  # noqa: E402
 
 CONV = "11111111-1111-1111-1111-111111111111"
 
@@ -19,12 +19,14 @@ class DiffAlertsTest(unittest.TestCase):
     def test_first_run_with_everything_fine_sends_nothing(self):
         self.assertIsNone(diff_alerts({}, {"a": "OK", "b": "STARTING"}))
 
-    def test_a_restart_is_reported(self):
-        self.assertEqual(diff_alerts({"a": "OK"}, {"a": "RESTARTED"}), "claude-rc: restarted a")
+    def test_a_restart_that_worked_is_logged_not_texted(self):
+        self.assertEqual(diff_changes({"a": "OK"}, {"a": "RESTARTED"}), "claude-rc: restarted a")
+        self.assertIsNone(diff_alerts({"a": "OK"}, {"a": "RESTARTED"}))
 
-    def test_coming_back_after_a_restart_is_reported_once(self):
-        self.assertEqual(diff_alerts({"a": "RESTARTED"}, {"a": "OK"}), "claude-rc: back a")
-        self.assertIsNone(diff_alerts({"a": "OK"}, {"a": "OK"}))
+    def test_coming_back_after_a_restart_is_logged_once_not_texted(self):
+        self.assertEqual(diff_changes({"a": "RESTARTED"}, {"a": "OK"}), "claude-rc: back a")
+        self.assertIsNone(diff_changes({"a": "OK"}, {"a": "OK"}))
+        self.assertIsNone(diff_alerts({"a": "RESTARTED"}, {"a": "OK"}))
 
     def test_a_new_problem_is_reported_once_with_its_reason(self):
         self.assertEqual(
@@ -45,23 +47,27 @@ class DiffAlertsTest(unittest.TestCase):
             "claude-rc: needs you admin (folder not trusted: open claude there once and accept)",
         )
 
-    def test_recovery_from_a_problem_is_reported(self):
-        self.assertEqual(diff_alerts({"a": "UNLINKED_STUCK"}, {"a": "OK"}), "claude-rc: back a")
+    def test_recovery_from_a_problem_is_logged_not_texted(self):
+        self.assertEqual(diff_changes({"a": "UNLINKED_STUCK"}, {"a": "OK"}), "claude-rc: back a")
+        self.assertIsNone(diff_alerts({"a": "UNLINKED_STUCK"}, {"a": "OK"}))
 
-    def test_several_changes_share_one_message(self):
-        msg = diff_alerts(
-            {"Ava-2": "OK", "CF": "OK", "Dev": "OK", "x": "RESTARTED"},
-            {"Ava-2": "RESTARTED", "CF": "RESTARTED", "Dev": "NOT_RUNNING", "x": "OK"},
-        )
-        self.assertEqual(msg, "claude-rc: restarted Ava-2, CF; needs you Dev (claude not running in its tmux session); back x")
+    def test_several_changes_share_one_log_line_and_only_problems_are_texted(self):
+        prev = {"Ava-2": "OK", "CF": "OK", "Dev": "OK", "x": "RESTARTED"}
+        now = {"Ava-2": "RESTARTED", "CF": "RESTARTED", "Dev": "NOT_RUNNING", "x": "OK"}
+        self.assertEqual(diff_changes(prev, now),
+                         "claude-rc: restarted Ava-2, CF; needs you Dev (claude not running in its tmux session); back x")
+        self.assertEqual(diff_alerts(prev, now), "claude-rc: needs you Dev (claude not running in its tmux session)")
 
     def test_a_host_removed_from_the_manifest_is_not_reported(self):
         self.assertIsNone(diff_alerts({"gone": "WRONG_CONVERSATION"}, {}))
 
     def test_long_messages_are_capped_for_sms(self):
         prev = {f"host-{i:02d}": "OK" for i in range(40)}
-        now = {k: "RESTARTED" for k in prev}
-        msg = diff_alerts(prev, now)
+        for now in ({k: "RESTARTED" for k in prev}, {k: "NOT_RUNNING" for k in prev}):
+            msg = diff_changes(prev, now)
+            self.assertLessEqual(len(msg), 300)
+            self.assertTrue(msg.endswith("more"))
+        msg = diff_alerts(prev, {k: "NOT_RUNNING" for k in prev})
         self.assertLessEqual(len(msg), 300)
         self.assertTrue(msg.endswith("more"))
 

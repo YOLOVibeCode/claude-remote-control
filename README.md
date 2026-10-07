@@ -117,8 +117,8 @@ chmod 600 ~/.config/claude-rc/secrets.env
 claude-rc notify-test alerts
 ```
 
-One SMS per change (restarted, needs you, back), never one per run; undelivered alerts are
-retried next run. Adding a vendor is one class in `claude_rc/notify/` plus one line in its
+One SMS when a session newly needs you, never one per run; restarts that worked and recoveries
+go to `watch.log` and the daily report instead. Undelivered alerts are retried next run. Adding a vendor is one class in `claude_rc/notify/` plus one line in its
 registry; `tests/test_providers.py` checks it against the same contract as the others.
 
 **Outside heartbeat (dead-man switch).** Nothing on this Mac can report the Mac itself being
