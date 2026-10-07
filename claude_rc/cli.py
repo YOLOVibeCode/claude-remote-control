@@ -47,7 +47,17 @@ from .ports import DeliveryError, EmailSender, TextSender
 
 DEFAULT_FLAGS = ("--dangerously-skip-permissions",)   # how `cc` starts sessions
 QUEUE_LIMIT = 20
+LOG_MAX_BYTES = 1_000_000   # watch.log / launchd.log roll over here, keeping one old copy (.1)
 POLL_S = 5
+
+def rotate(path: str, max_bytes: int = LOG_MAX_BYTES) -> None:
+    """Move a log past the cap to <path>.1 (replacing the previous one)."""
+    try:
+        if os.path.getsize(path) > max_bytes:
+            os.replace(path, path + ".1")
+    except FileNotFoundError:
+        pass
+
 
 # claude flags that take a value: kept with their value when recording a session's flags.
 VALUE_FLAGS = {"--model", "--permission-mode", "--add-dir", "--agent", "--settings", "--mcp-config",
@@ -89,6 +99,7 @@ class App:
     # --- helpers ----------------------------------------------------------------------------
     def log(self, line: str) -> None:
         os.makedirs(self.home, mode=0o700, exist_ok=True)
+        rotate(os.path.join(self.home, "watch.log"))
         fd = os.open(os.path.join(self.home, "watch.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(self.clock.now()))} {line}\n")
@@ -194,6 +205,8 @@ class App:
             return self._watch()
 
     def _watch(self) -> int:
+        # launchd reopens launchd.log at every run, so rolling it between runs is safe.
+        rotate(os.path.join(self.home, "launchd.log"))
         prev, histories, queued = self.state.load()
         entries = self.manifest.load()
         rows = self._observe(entries, histories)

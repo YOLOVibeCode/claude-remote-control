@@ -254,6 +254,22 @@ class AppTest(unittest.TestCase):
         with open(os.path.join(self.home, "watch.log")) as f:
             self.assertIn("heartbeat not delivered", f.read())
 
+    def test_logs_roll_over_at_the_cap_keeping_one_old_copy(self):
+        import claude_rc.cli as cli
+        self.pin_app()
+        log = os.path.join(self.home, "watch.log")
+        launchd = os.path.join(self.home, "launchd.log")
+        for path in (log, launchd):
+            with open(path, "w") as f:
+                f.write("x" * (cli.LOG_MAX_BYTES + 10))
+        self.app().watch()
+        for path in (log, launchd):
+            self.assertTrue(os.path.exists(path + ".1"), path)
+            self.assertGreater(os.path.getsize(path + ".1"), cli.LOG_MAX_BYTES)
+        self.assertLess(os.path.getsize(log), 10_000)
+        import stat
+        self.assertEqual(stat.S_IMODE(os.stat(log).st_mode), 0o600)
+
     # check / report --------------------------------------------------------------------------
     def test_check_exits_nonzero_when_something_is_wrong_and_prints_json(self):
         self.pin_app()
