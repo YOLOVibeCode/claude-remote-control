@@ -24,6 +24,7 @@ class State(str, Enum):
     STARTING = "STARTING"                      # inside the grace period after a restart
     RESTART_FAILED = "RESTART_FAILED"          # restarted, never came up on its conversation
     DISABLED = "DISABLED"                      # `enabled: false` in the manifest
+    PARKED = "PARKED"                          # stopped on purpose (policy or `claude-rc park`): never restarted
 
 
 @dataclass(frozen=True)
@@ -79,14 +80,8 @@ class PaneInfo:
     panes: int
 
 
-def classify(entry: Entry, has_session: bool, record: Optional[Record], history: History, now: float) -> State:
-    if not entry.enabled:
-        return State.DISABLED
-    live = record if record is not None and record.alive else None
-    if live is not None:
-        if live.conversation != entry.conversation:
-            return State.WRONG_CONVERSATION
-        return State.OK if live.linked else State.UNLINKED
+def _after_restart(history: History, now: float) -> Optional[State]:
+    """STARTING inside the grace period, RESTART_FAILED for an hour after one never came up."""
     last_restart = history.restarts[-1] if history.restarts else None
     if last_restart is not None and now - last_restart < RESTART_GRACE_S:
         return State.STARTING
@@ -95,6 +90,23 @@ def classify(entry: Entry, has_session: bool, record: Optional[Record], history:
     if history.last_state in (State.STARTING, State.RESTART_FAILED) and last_restart is not None \
             and now - last_restart < RETRY_FAILED_AFTER_S:
         return State.RESTART_FAILED
+    return None
+
+
+def classify(entry: Entry, has_session: bool, record: Optional[Record], history: History, now: float) -> State:
+    if not entry.enabled:
+        return State.DISABLED
+    live = record if record is not None and record.alive else None
+    if live is not None:
+        if live.conversation != entry.conversation:
+            return State.WRONG_CONVERSATION
+        return State.OK if live.linked else State.UNLINKED
+    # Parked on purpose: never DEAD (that would restart it) and never NOT_RUNNING (that would alert).
+    if history.parked_at is not None:
+        return State.PARKED
+    after = _after_restart(history, now)
+    if after is not None:
+        return after
     return State.NOT_RUNNING if has_session else State.DEAD
 
 
@@ -118,6 +130,8 @@ class Observation:
     state: State
     status: Optional[str]  # registry status of the live process (idle | busy | shell), if any
     trusted: bool = True   # Claude Code trusts entry.dir; if not, a restart stops at the trust prompt
+    pid: Optional[int] = None             # the live claude process, if any
+    status_since: Optional[float] = None  # when its status last changed (idle since, when idle)
 
 
 @dataclass(frozen=True)
@@ -131,6 +145,18 @@ class Restart:
 class Relink:
     """Type /remote-control into an idle host whose link dropped."""
     name: str
+
+
+@dataclass(frozen=True)
+class Stop:
+    """Park a live host: type /exit when it is safe, fall back to closing its tmux session.
+    `observed` and `fallback` restore its state and condition if the stop is blocked."""
+    name: str
+    pid: int
+    reason: str                     # idle | night | budget | manual
+    status_since: Optional[float]   # if the session's status moved past this, it was used: do not stop
+    observed: State
+    fallback: str
 
 
 @dataclass(frozen=True)
@@ -151,7 +177,13 @@ def plan(observations: List[Observation], histories: Dict[str, History], now: fl
         idle_runs, relinked_at, last = h.idle_unlinked_runs, h.relinked_at, o.state
         condition = o.state.value
 
-        if o.state is State.DEAD and not o.trusted:
+        parked_at, parked_reason = h.parked_at, h.parked_reason
+        if o.state in (State.OK, State.UNLINKED):
+            parked_at, parked_reason = None, None   # running on its conversation again: not parked
+
+        if o.state is State.PARKED:
+            condition = "PARKED"
+        elif o.state is State.DEAD and not o.trusted:
             condition = "UNTRUSTED"
         elif o.state is State.DEAD:
             if len(recent) < MAX_RESTARTS_PER_HOUR:
@@ -172,7 +204,8 @@ def plan(observations: List[Observation], histories: Dict[str, History], now: fl
 
         conditions[name] = condition
         out[name] = replace(h, restarts=recent, last_state=last, idle_unlinked_runs=idle_runs, relinked_at=relinked_at,
-                            note=h.note if any(getattr(a, "name", None) == name for a in actions) else None)
+                            note=h.note if any(getattr(a, "name", None) == name for a in actions) else None,
+                            parked_at=parked_at, parked_reason=parked_reason)
     return Decision(tuple(actions), conditions, out)
 
 
@@ -360,3 +393,27 @@ def input_is_empty(pane_ansi: str) -> bool:
     typed = after.split(_DIM, 1)[0]
     typed = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", typed)
     return typed.strip(" \xa0\t") == ""
+
+
+def stop_blocker(fresh: Optional[Record], pane: Optional[PaneInfo], pane_ansi: str, pid: int,
+                 status_since: Optional[float]) -> Optional[str]:
+    """Why typing /exit into this host is not safe right now, or None. "gone" means it already
+    exited, which counts as parked. Checked again right before typing: the phone may have just
+    sent it something."""
+    if fresh is None or not fresh.alive or fresh.pid != pid:
+        return "gone"
+    if fresh.status != "idle":
+        return f"became {fresh.status or 'unknown'}"
+    if status_since is not None and fresh.status_since is not None and fresh.status_since > status_since:
+        return "became active"
+    if pane is None:
+        return "no pane"
+    if pane.windows > 1 or pane.panes > 1:
+        return "session has other windows or panes"
+    if pane.in_mode:
+        return "copy mode"
+    if pane.pid != pid:
+        return "claude is not the pane's own process"
+    if not input_is_empty(pane_ansi):
+        return "text in its input box"
+    return None

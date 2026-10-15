@@ -4,7 +4,9 @@
     claude-rc pin NAME DIR UUID -- ARGS   record a new session (called by the claude() wrapper)
     claude-rc has NAME                 exit 0 if NAME is pinned
     claude-rc keep|auto NAME...        keep: always running, never parked; auto: parked when idle
-    claude-rc up [NAME...]             start pinned hosts that have no tmux session
+    claude-rc up [NAME...]             start pinned hosts that have no tmux session (parked ones only if named)
+    claude-rc park NAME...             stop a host on purpose (/exit); it stays parked
+    claude-rc unpark NAME...|--all     bring parked hosts back on the same conversation
     claude-rc check [--json]           state of every pinned host; exit 1 if any needs attention
     claude-rc watch                    check, restart/relink what is safe, alert on changes
     claude-rc report                   email the daily all-clear
@@ -26,7 +28,7 @@ import sys
 import time
 import traceback
 from dataclasses import replace
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, TextIO, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, TextIO, Tuple
 
 from .core import (
     ESCALATE_AFTER,
@@ -41,6 +43,7 @@ from .core import (
     ReportRow,
     Restart,
     State,
+    Stop,
     adopt,
     classify,
     coalesce_queue,
@@ -49,6 +52,8 @@ from .core import (
     input_is_empty,
     format_report,
     plan,
+    restart_argv,
+    stop_blocker,
     track_delivery,
 )
 from .ports import DeliveryError, EmailSender, TextSender
@@ -57,6 +62,7 @@ DEFAULT_FLAGS = ("--dangerously-skip-permissions",)   # how `cc` starts sessions
 QUEUE_LIMIT = 20
 LOG_MAX_BYTES = 1_000_000   # watch.log / launchd.log roll over here, keeping one old copy (.1)
 POLL_S = 5
+STOP_GRACE_S = 30   # a parked host gets this long to exit after /exit before its tmux session is closed
 
 def rotate(path: str, max_bytes: int = LOG_MAX_BYTES) -> None:
     """Move a log past the cap to <path>.1 (replacing the previous one)."""
@@ -120,14 +126,22 @@ class App:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(self.clock.now()))} {line}\n")
 
     @contextlib.contextmanager
-    def locked(self) -> Iterator[bool]:
+    def locked(self, wait_s: float = 0) -> Iterator[bool]:
+        """The watch lock. Commands that change sessions wait for a running watch; watch itself never waits."""
         os.makedirs(self.home, mode=0o700, exist_ok=True)
-        with open(os.path.join(self.home, "watch.lock"), "w") as f:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                yield False
-                return
+        fd = os.open(os.path.join(self.home, "watch.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "w") as f:
+            waited = 0.0
+            while True:
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if waited >= wait_s:
+                        yield False
+                        return
+                    self.sleep(0.5)
+                    waited += 0.5
             try:
                 yield True
             finally:
@@ -144,16 +158,86 @@ class App:
                 out[r.tmux_session] = r
         return out
 
-    def _observe(self, entries: List[Entry], histories: Dict[str, History]) -> List[Tuple[Observation, Optional[Record]]]:
+    def _session_names(self) -> Tuple[bool, Optional[Set[str]]]:
+        """(answered, names): every tmux session in one call. (False, None) when tmux hung;
+        (True, None) when the multiplexer cannot list, so callers ask per session."""
+        ls = getattr(self.mux, "list_sessions", None)
+        if ls is None:
+            return True, None
+        names = ls()
+        return names is not None, names
+
+    def _observe(self, entries: List[Entry], histories: Dict[str, History],
+                 names: Optional[Set[str]] = None) -> List[Tuple[Observation, Optional[Record]]]:
         recs = self._records_by_name()
         now = self.clock.now()
+        if names is None:
+            names = self._session_names()[1]
         rows = []
         for e in entries:
             r = recs.get(e.name)
-            state = classify(e, self.mux.has_session(e.name), r, histories.get(e.name, History()), now)
+            has = (e.name in names) if names is not None else self.mux.has_session(e.name)
+            state = classify(e, has, r, histories.get(e.name, History()), now)
             trusted = self.trust.trusted(e.dir) if self.trust is not None else True
-            rows.append((Observation(e, state, r.status if r and r.alive else None, trusted), r))
+            live = r if r is not None and r.alive else None
+            rows.append((Observation(e, state, live.status if live else None, trusted,
+                                     live.pid if live else None, live.status_since if live else None), r))
         return rows
+
+    # --- parking ------------------------------------------------------------------------------
+    def _revert_stop(self, s: Stop, blocker: str, conditions: Dict[str, str], histories: Dict[str, History]) -> None:
+        """A stop that could not happen: the host keeps running, as it was."""
+        h = histories.get(s.name, History())
+        conditions[s.name] = s.fallback
+        histories[s.name] = replace(h, parked_at=None, parked_reason=None, last_state=s.observed, note=blocker)
+        if h.note != blocker:
+            self.log(f"park skipped for {s.name}: {blocker}")
+
+    def _run_stops(self, stops: List[Stop], conditions: Dict[str, str], histories: Dict[str, History]) -> None:
+        """Type /exit into each host that is safe to stop, wait for it to exit, and close the tmux
+        session only if it is still idle. Never signals a process directly."""
+        if not stops:
+            return
+        by_pid = {r.pid: r for r in self.registry.live_sessions()}
+        typed: Dict[str, Stop] = {}
+        for s in stops:
+            pane = self.mux.pane_info(s.name)
+            text = self.mux.capture(s.name, 40, ansi=True) if pane is not None else ""
+            blocker = stop_blocker(by_pid.get(s.pid), pane, text, s.pid, s.status_since)
+            if blocker == "gone":
+                continue  # already exited: parked
+            if blocker is None:
+                try:
+                    self.mux.send_keys(s.name, "/exit")
+                    typed[s.name] = s
+                    continue
+                except RuntimeError as e:
+                    blocker = "tmux send-keys failed"
+                    self.log(f"park {s.name}: {e}")
+            self._revert_stop(s, blocker, conditions, histories)
+        if not typed:
+            return
+        pending = {n: s.pid for n, s in typed.items()}
+        for _ in range(int(STOP_GRACE_S // POLL_S) + 1):
+            alive = {r.pid for r in self.registry.live_sessions() if r.alive}
+            for n, pid in list(pending.items()):
+                if pid not in alive:
+                    del pending[n]
+            if not pending:
+                break
+            self.sleep(POLL_S)
+        for n, s in typed.items():
+            if n not in pending:
+                if self.mux.has_session(n):
+                    self.mux.kill_session(n)  # claude exited but left the session behind
+                continue
+            fresh = {r.pid: r for r in self.registry.live_sessions()}.get(s.pid)
+            if fresh is not None and fresh.alive and fresh.status == "idle":
+                tail = self.mux.capture(n, 20).strip().splitlines()[-6:]
+                self.mux.kill_session(n)
+                self.log(f"park: /exit did not end {n} in {STOP_GRACE_S}s; closed its tmux session; pane: " + " | ".join(tail))
+            else:
+                self._revert_stop(s, "became busy", conditions, histories)
 
     # --- commands ---------------------------------------------------------------------------
     def adopt(self, quiet: bool = False) -> int:
@@ -194,28 +278,109 @@ class App:
     def has(self, name: str) -> int:
         return 0 if any(e.name == name for e in self.manifest.load()) else 1
 
-    def up(self, names: Sequence[str] = ()) -> int:
-        conditions, histories, queued = self.state.load()
-        now = self.clock.now()
-        for e in self.manifest.load():
-            if not e.enabled or (names and e.name not in names) or self.mux.has_session(e.name):
-                continue
-            argv = [self.claude_bin, "--remote-control", e.name, "--resume", e.conversation, *e.flags]
-            self.mux.new_session(e.name, e.dir, argv)
-            h = histories.get(e.name, History())
-            histories[e.name] = replace(h, restarts=h.restarts + (now,), last_state=State.STARTING,
-                                        idle_unlinked_runs=0, relinked_at=None)
-            print(f"started {e.name} on {e.conversation[:8]}", file=self.out)
-            self.log(f"up: started {e.name}")
-        self.state.save(conditions, histories, queued)
+    def up(self, names: Sequence[str] = (), wait_s: float = 120.0) -> int:
+        """Start pinned hosts that have no tmux session. Parked hosts start only when named."""
+        with self.locked(wait_s) as got:
+            if not got:
+                print("busy: a watch run holds the lock; try again in a minute", file=self.out)
+                return 1
+            conditions, histories, queued = self.state.load()
+            now = self.clock.now()
+            open_in = {r.conversation: r.tmux_session for r in self.registry.live_sessions()
+                       if r.alive and r.tmux_session}
+            skipped: List[str] = []
+            for e in self.manifest.load():
+                if not e.enabled or (names and e.name not in names):
+                    continue
+                h = histories.get(e.name, History())
+                if h.parked_at is not None and not names:
+                    skipped.append(e.name)
+                    continue
+                if self.mux.has_session(e.name):
+                    if h.parked_at is not None:
+                        histories[e.name] = replace(h, parked_at=None, parked_reason=None)
+                    continue
+                other = open_in.get(e.conversation)
+                if other and other != e.name:
+                    print(f"{e.name}: its conversation is already open in tmux session {other}", file=self.out)
+                    continue
+                try:
+                    self.mux.new_session(e.name, e.dir, restart_argv(e, self.claude_bin))
+                except RuntimeError as err:
+                    print(f"{e.name}: {err}", file=self.out)
+                    continue
+                histories[e.name] = replace(h, restarts=h.restarts + (now,), last_state=State.STARTING,
+                                            idle_unlinked_runs=0, relinked_at=None, parked_at=None,
+                                            parked_reason=None, note=None)
+                print(f"started {e.name} on {e.conversation[:8]}", file=self.out)
+                self.log(f"up: started {e.name}")
+            if skipped:
+                more = "..." if len(skipped) > 5 else ""
+                print(f"skipped {len(skipped)} parked ({', '.join(skipped[:5])}{more}); "
+                      f"start one with: claude-rc unpark NAME", file=self.out)
+            self.state.save(conditions, histories, queued)
         return 0
+
+    def unpark(self, names: Sequence[str] = (), all_: bool = False) -> int:
+        """Bring parked hosts back on the same conversation."""
+        if all_:
+            _, histories, _ = self.state.load()
+            pinned = {e.name for e in self.manifest.load()}
+            names = [n for n, h in histories.items() if h.parked_at is not None and n in pinned]
+            if not names:
+                print("nothing parked", file=self.out)
+                return 0
+        if not names:
+            print("name a session, or use --all", file=self.out)
+            return 2
+        return self.up(names)
+
+    def park(self, names: Sequence[str]) -> int:
+        """Stop hosts on purpose; they stay parked until `claude-rc unpark`."""
+        entries = {e.name: e for e in self.manifest.load()}
+        unknown = [n for n in names if n not in entries]
+        if unknown:
+            print(f"not pinned: {', '.join(unknown)}", file=self.out)
+            return 2
+        with self.locked(60) as got:
+            if not got:
+                print("busy: a watch run holds the lock; try again in a minute", file=self.out)
+                return 1
+            conditions, histories, queued = self.state.load()
+            now = self.clock.now()
+            stops: List[Stop] = []
+            for o, _ in self._observe([entries[n] for n in names], histories):
+                n = o.entry.name
+                h = histories.get(n, History())
+                if o.state is State.PARKED:
+                    print(f"{n}: already parked", file=self.out)
+                    continue
+                if o.state in (State.OK, State.UNLINKED) and o.pid is not None:
+                    stops.append(Stop(n, o.pid, "manual", o.status_since, o.state, conditions.get(n, o.state.value)))
+                elif o.state not in (State.DEAD, State.NOT_RUNNING, State.RESTART_FAILED):
+                    print(f"{n}: {o.state.value}; not parked", file=self.out)
+                    continue
+                conditions[n] = "PARKED"
+                histories[n] = replace(h, parked_at=now, parked_reason="manual", last_state=State.PARKED)
+            self._run_stops(stops, conditions, histories)
+            self.state.save(conditions, histories, queued)
+        bad = 0
+        for n in names:
+            if conditions.get(n) == "PARKED":
+                print(f"parked {n}", file=self.out)
+                self.log(f"park: {n} (manual)")
+            else:
+                bad += 1
+                print(f"{n}: not parked ({histories.get(n, History()).note or conditions.get(n)})", file=self.out)
+        return 1 if bad else 0
 
     def check(self, as_json: bool = False) -> int:
         _, histories, _ = self.state.load()
         rows = self._observe(self.manifest.load(), histories)
         data = [{"name": o.entry.name, "state": o.state.value, "conversation": o.entry.conversation,
                  "linked": bool(r and r.linked), "status": o.status, "version": r.version if r else None,
-                 "trusted": o.trusted}
+                 "trusted": o.trusted, "tier": o.entry.tier,
+                 "parked_reason": histories.get(o.entry.name, History()).parked_reason if o.state is State.PARKED else None}
                 for o, r in rows]
         if as_json:
             json.dump(data, self.out, indent=2)
@@ -224,8 +389,10 @@ class App:
             for d in data:
                 print(f"{d['state']:<19} {d['name']:<24} {d['conversation'][:8]}  "
                       f"{'linked' if d['linked'] else 'no-link'}  {d['status'] or '-'}"
+                      f"{'  keep' if d['tier'] == 'keep' else ''}"
+                      f"{'  (' + d['parked_reason'] + ')' if d['parked_reason'] else ''}"
                       f"{'' if d['trusted'] else '  (folder not trusted: restart would stop at the prompt)'}", file=self.out)
-        fine = {State.OK, State.DISABLED, State.STARTING}
+        fine = {State.OK, State.DISABLED, State.STARTING, State.PARKED}
         return 0 if all(o.state in fine for o, _ in rows) else 1
 
     def watch(self) -> int:
@@ -513,6 +680,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     k = sub.add_parser("keep"); k.add_argument("names", nargs="+")  # noqa: E702
     au = sub.add_parser("auto"); au.add_argument("names", nargs="+")  # noqa: E702
     u = sub.add_parser("up"); u.add_argument("names", nargs="*")  # noqa: E702
+    pk = sub.add_parser("park"); pk.add_argument("names", nargs="+")  # noqa: E702
+    upk = sub.add_parser("unpark"); upk.add_argument("names", nargs="*"); upk.add_argument("--all", action="store_true")  # noqa: E702
     c = sub.add_parser("check"); c.add_argument("--json", action="store_true")  # noqa: E702
     sub.add_parser("watch")
     sub.add_parser("report")
@@ -531,6 +700,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return app.set_tier(ns.names, ns.cmd)
     if ns.cmd == "up":
         return app.up(ns.names)
+    if ns.cmd == "park":
+        return app.park(ns.names)
+    if ns.cmd == "unpark":
+        return app.unpark(ns.names, ns.all)
     if ns.cmd == "check":
         return app.check(ns.json)
     if ns.cmd == "watch":

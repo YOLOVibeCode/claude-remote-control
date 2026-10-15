@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -56,10 +57,15 @@ class FakeMux:
             conv = argv[argv.index("--resume") + 1]
             self.registry.records.append(Record(99, conv, directory, name, "idle", True, "2.1.291", True))
 
+    exit_works = True
+
     def send_keys(self, name, text):
         if self.keys_fail:
             raise RuntimeError("tmux send-keys app failed: timed out")
         self.calls.append(("keys", name, text))
+        if text == "/exit" and self.exit_works:  # claude exits and its tmux session closes
+            self.registry.records = [replace(r, alive=False) if r.tmux_session == name else r for r in self.registry.records]
+            self.sessions.discard(name)
 
     pane = "\x1b[39m❯\xa0\n"
 
@@ -174,6 +180,105 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.app().set_tier(["app"], "auto"), 0)
         self.assertEqual(self.manifest.load()[0].tier, "auto")
         self.assertEqual(self.app().set_tier(["nope"], "keep"), 2)
+
+    # park / unpark / up ----------------------------------------------------------------------
+    def live_app(self, status="idle", since=None, linked=True):
+        self.pin_app()
+        self.mux.sessions.add("app")
+        self.reg.records = [Record(1, CONV, "/w/app", "app", status, linked, "2.1.300", True,
+                                   status_since=since if since is not None else self.clock.t - 3600)]
+
+    def test_park_types_exit_and_the_host_stays_parked(self):
+        self.live_app()
+        self.assertEqual(self.app().park(["app"]), 0)
+        self.assertEqual([c for c in self.mux.calls if c[0] == "keys"], [("keys", "app", "/exit")])
+        self.clock.t += 600
+        self.app().watch()
+        self.clock.t += 600
+        self.app().watch()
+        self.assertEqual([c for c in self.mux.calls if c[0] == "new"], [])   # never restarted
+        self.assertEqual(self.text.sent, [])                                  # and nothing to text
+        self.assertEqual(self.app().check(), 0)                               # parked is fine
+
+    def test_park_is_blocked_by_a_draft_or_copy_mode_and_says_why(self):
+        self.live_app()
+        self.mux.pane = "\x1b[39m❯\xa0half-written thought\n"
+        self.assertEqual(self.app().park(["app"]), 1)
+        self.assertIn("not parked (text in its input box)", self.out.getvalue())
+        self.mux.pane = "\x1b[39m❯\xa0\n"
+        self.mux.copy_mode.add("app")
+        self.assertEqual(self.app().park(["app"]), 1)
+        self.assertEqual([c for c in self.mux.calls if c[0] == "keys"], [])
+
+    def test_park_never_stops_a_busy_host(self):
+        self.live_app(status="busy")
+        self.assertEqual(self.app().park(["app"]), 1)
+        self.assertEqual([c for c in self.mux.calls if c[0] == "keys"], [])
+
+    def test_an_exit_that_hangs_closes_the_session_only_while_idle(self):
+        self.live_app()
+        self.mux.exit_works = False
+        self.assertEqual(self.app().park(["app"]), 0)
+        self.assertIn(("kill", "app"), self.mux.calls)
+        self.assertIn("/exit did not end app", self.log())
+
+    def test_an_exit_that_hangs_while_now_busy_is_not_killed(self):
+        self.live_app()
+        self.mux.exit_works = False
+        outer = self
+
+        class BusyAfterTyping(FakeRegistry):
+            def live_sessions(self):
+                typed = any(c[0] == "keys" for c in outer.mux.calls)
+                return [replace(r, status="busy") if typed else r for r in outer.reg.records]
+
+        self.assertEqual(self.app(registry=BusyAfterTyping()).park(["app"]), 1)
+        self.assertNotIn(("kill", "app"), self.mux.calls)
+
+    def test_up_skips_parked_unless_named_and_unpark_resumes_the_same_chat(self):
+        self.live_app()
+        self.app().park(["app"])
+        self.app().up()
+        self.assertEqual([c for c in self.mux.calls if c[0] == "new"], [])
+        self.assertIn("skipped 1 parked", self.out.getvalue())
+        self.assertEqual(self.app().unpark(["app"]), 0)
+        self.assertEqual([c for c in self.mux.calls if c[0] == "new"][0],
+                         ("new", "app", "/w/app", (BIN, "--remote-control", "app", "--resume", CONV, "--dangerously-skip-permissions")))
+        _, histories, _ = self.state.load()
+        self.assertIsNone(histories["app"].parked_at)
+
+    def test_unpark_all_and_nothing_parked(self):
+        self.pin_app()
+        self.assertEqual(self.app().unpark(all_=True), 0)
+        self.assertIn("nothing parked", self.out.getvalue())
+
+    def test_unpark_refuses_when_the_conversation_is_open_elsewhere(self):
+        self.live_app()
+        self.app().park(["app"])
+        self.reg.records = [Record(5, CONV, "/w/app", "app-2", "idle", True, "2.1.300", True)]  # ccc resumed it
+        self.app().unpark(["app"])
+        self.assertEqual([c for c in self.mux.calls if c[0] == "new"], [])
+        self.assertIn("already open in tmux session app-2", self.out.getvalue())
+
+    def test_up_waits_for_the_lock_and_gives_up_cleanly(self):
+        self.pin_app()
+        a = self.app()
+        with a.locked() as got:
+            self.assertTrue(got)
+            self.assertEqual(self.app().up(wait_s=1), 1)
+        self.assertEqual(self.mux.calls, [])
+
+    def test_the_lock_file_is_private(self):
+        import stat
+        with self.app().locked():
+            pass
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.home, "watch.lock")).st_mode), 0o600)
+
+    def test_park_a_dead_host_marks_it_parked(self):
+        self.pin_app()
+        self.assertEqual(self.app().park(["app"]), 0)
+        self.app().watch()
+        self.assertEqual([c for c in self.mux.calls if c[0] == "new"], [])
 
     # watch ----------------------------------------------------------------------------------
     def test_watch_restarts_a_dead_host_and_logs_restart_then_return_without_texting(self):

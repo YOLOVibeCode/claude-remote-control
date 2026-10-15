@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from claude_rc.core import (  # noqa: E402
     ChannelHealth,
     Entry,
+    PaneInfo,
     History,
     Record,
     State,
@@ -17,6 +18,7 @@ from claude_rc.core import (  # noqa: E402
     coalesce_queue,
     input_is_empty,
     restart_argv,
+    stop_blocker,
     track_delivery,
 )
 
@@ -120,6 +122,73 @@ class InputIsEmptyTest(unittest.TestCase):
 
     def test_no_prompt_at_all_is_not_safe_to_type_into(self):
         self.assertFalse(input_is_empty("$ \n"))
+
+
+class ParkedClassifyTest(unittest.TestCase):
+    def test_parked_when_history_says_parked_and_nothing_runs(self):
+        h = History(parked_at=NOW - 60, parked_reason="idle")
+        self.assertEqual(classify(entry(), has_session=False, record=None, history=h, now=NOW), State.PARKED)
+        self.assertEqual(classify(entry(), has_session=True, record=None, history=h, now=NOW), State.PARKED)
+
+    def test_parked_beats_restart_failed_and_starting(self):
+        h = History(restarts=(NOW - 10,), last_state=State.STARTING, parked_at=NOW - 5)
+        self.assertEqual(classify(entry(), has_session=False, record=None, history=h, now=NOW), State.PARKED)
+
+    def test_a_parked_host_running_on_its_conversation_is_ok(self):
+        h = History(parked_at=NOW - 60)
+        self.assertEqual(classify(entry(), has_session=True, record=record(), history=h, now=NOW), State.OK)
+
+    def test_disabled_beats_parked(self):
+        h = History(parked_at=NOW - 60)
+        self.assertEqual(classify(entry(enabled=False), has_session=False, record=None, history=h, now=NOW), State.DISABLED)
+
+
+EMPTY = "\x1b[39m❯\xa0\n"
+
+
+class StopBlockerTest(unittest.TestCase):
+    def fresh(self, **kw):
+        base = dict(status_since=NOW - 3600)
+        base.update(kw)
+        return record(**base)
+
+    def pane(self, **kw):
+        base = dict(pid=42, in_mode=False, dead=False, windows=1, panes=1)
+        base.update(kw)
+        return PaneInfo(**base)
+
+    def blocker(self, fresh=None, pane=None, text=EMPTY, since=NOW - 3600):
+        return stop_blocker(self.fresh() if fresh is None else fresh, self.pane() if pane is None else pane, text, 42, since)
+
+    def test_a_clean_idle_pane_has_no_blocker(self):
+        self.assertIsNone(self.blocker())
+
+    def test_an_exited_process_is_gone(self):
+        self.assertEqual(stop_blocker(None, self.pane(), EMPTY, 42, NOW), "gone")
+        self.assertEqual(self.blocker(fresh=self.fresh(alive=False)), "gone")
+
+    def test_busy_or_waiting_blocks(self):
+        self.assertEqual(self.blocker(fresh=self.fresh(status="busy")), "became busy")
+        self.assertEqual(self.blocker(fresh=self.fresh(status="waiting")), "became waiting")
+
+    def test_activity_since_the_plan_blocks(self):
+        self.assertEqual(self.blocker(fresh=self.fresh(status_since=NOW - 10), since=NOW - 3600), "became active")
+
+    def test_other_windows_or_panes_block(self):
+        self.assertEqual(self.blocker(pane=self.pane(windows=2)), "session has other windows or panes")
+        self.assertEqual(self.blocker(pane=self.pane(panes=2)), "session has other windows or panes")
+
+    def test_copy_mode_blocks(self):
+        self.assertEqual(self.blocker(pane=self.pane(in_mode=True)), "copy mode")
+
+    def test_claude_must_be_the_pane_process(self):
+        self.assertEqual(self.blocker(pane=self.pane(pid=7)), "claude is not the pane's own process")
+
+    def test_a_draft_blocks(self):
+        self.assertEqual(self.blocker(text="\x1b[39m❯\xa0half-written\n"), "text in its input box")
+
+    def test_no_pane_blocks(self):
+        self.assertEqual(stop_blocker(self.fresh(), None, "", 42, NOW - 3600), "no pane")
 
 
 class DeliveryHealthTest(unittest.TestCase):

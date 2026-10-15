@@ -126,5 +126,26 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(d.histories["b"].last_state, State.UNLINKED)
 
 
+class ParkedPlanTest(unittest.TestCase):
+    def test_a_parked_host_is_left_alone_and_needs_nothing(self):
+        h = {"app": History(parked_at=NOW - 600, parked_reason="idle")}
+        d = plan([obs(State.PARKED, status=None)], h, NOW, BIN)
+        self.assertEqual(d.actions, ())
+        self.assertEqual(d.conditions["app"], "PARKED")
+        self.assertEqual(d.histories["app"].parked_reason, "idle")
+        self.assertNotIn("PARKED", NEEDS_YOU)
+
+    def test_back_on_its_conversation_clears_parked(self):
+        h = {"app": History(parked_at=NOW - 600, parked_reason="manual")}
+        d = plan([obs(State.OK)], h, NOW, BIN)
+        self.assertIsNone(d.histories["app"].parked_at)
+        self.assertIsNone(d.histories["app"].parked_reason)
+
+    def test_wrong_conversation_keeps_the_parked_memory(self):
+        h = {"app": History(parked_at=NOW - 600, parked_reason="manual")}
+        d = plan([obs(State.WRONG_CONVERSATION)], h, NOW, BIN)
+        self.assertEqual(d.histories["app"].parked_reason, "manual")
+
+
 if __name__ == "__main__":
     unittest.main()
