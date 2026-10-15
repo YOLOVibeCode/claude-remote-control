@@ -12,6 +12,9 @@
   <key>StartInterval</key><integer>600</integer>
   <!-- Also at login, so a reboot is recovered without waiting 10 minutes. -->
   <key>RunAtLoad</key><true/>
+  <!-- The first run after a reboot starts the tmux server, and every session in it inherits this
+       job's priority. Interactive keeps them normal; night throttling is explicit (taskpolicy). -->
+  <key>ProcessType</key><string>Interactive</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>__PATH__</string>
