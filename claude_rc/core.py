@@ -198,6 +198,108 @@ def is_night(p: Policy, hour: int) -> bool:
     return hour >= p.night_start_hour or hour < p.night_end_hour
 
 
+# --- the door: one always-on Remote Control server the phone can always reach -----------------
+
+DOOR_SESSION = "remote"   # the tmux session `ccserve` uses
+DOOR_KEY = "@door"        # its key in conditions and histories; no tmux session name can start with @
+
+
+@dataclass(frozen=True)
+class DoorConfig:
+    enabled: bool = False
+    session: str = DOOR_SESSION
+    name: str = ""                        # Remote Control environment name; "" = this Mac's short hostname
+    dir: str = "~/Dev"
+    spawn: str = "same-dir"               # same-dir | worktree | session
+    capacity: int = 2                     # sessions the phone can start at once (not used with spawn=session)
+    permission_mode: str = "acceptEdits"  # edits go through; commands ask on the phone
+
+
+def _word(v: str) -> bool:
+    import re
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", v))
+
+
+_DOOR_RULES: Dict[str, Tuple[type, object]] = {
+    "enabled": (bool, None),
+    "session": (str, _word),
+    "name": (str, lambda v: v == "" or _word(v)),
+    "dir": (str, lambda v: v.strip() != ""),
+    "spawn": (str, lambda v: v in ("same-dir", "worktree", "session")),
+    "capacity": (int, lambda v: 1 <= v <= 32),
+    "permission_mode": (str, lambda v: v.isalpha()),
+}
+
+
+def parse_door(raw: object) -> Tuple[DoorConfig, List[str]]:
+    door, warnings = _parse_section(raw, DoorConfig(), _DOOR_RULES, "door")
+    return door, warnings  # type: ignore[return-value]
+
+
+def door_argv(d: DoorConfig, claude_bin: str, name: str) -> List[str]:
+    argv = [claude_bin, "remote-control", "--name", name, "--spawn", d.spawn]
+    if d.spawn != "session":
+        argv += ["--capacity", str(d.capacity)]
+    return argv + ["--permission-mode", d.permission_mode]
+
+
+def is_door_command(cmd: str) -> bool:
+    """True for `claude remote-control ...` (the server), not for `claude --remote-control NAME` (a host)."""
+    parts = cmd.split()
+    return len(parts) > 1 and parts[1] == "remote-control"
+
+
+@dataclass(frozen=True)
+class DoorObservation:
+    exists: bool                  # its tmux session exists
+    server_pid: Optional[int]     # the pane's process, when it is the Remote Control server
+    trusted: bool = True
+
+
+@dataclass(frozen=True)
+class StartDoor:
+    session: str
+    dir: str
+    argv: Tuple[str, ...]
+
+
+def plan_door(d: DoorConfig, o: DoorObservation, h: History, now: float, argv: List[str],
+              background: bool) -> Tuple[Tuple[object, ...], Optional[str], History]:
+    """Keep the door up: start it when its session is gone (3 an hour), never touch a session that
+    runs something else, and drop it to background priority at night."""
+    if not d.enabled:
+        return (), None, History()
+    actions: List[object] = []
+    recent = tuple(t for t in h.restarts if now - t < 3600)
+    last, throttled = h.last_state, h.throttled_pid
+    if o.server_pid is not None:
+        condition, last = "OK", State.OK
+        if throttled is not None and throttled != o.server_pid:
+            throttled = None
+        if background and throttled is None:
+            actions.append(Throttle(DOOR_KEY, o.server_pid, True))
+            throttled = o.server_pid
+        elif not background and throttled is not None:
+            actions.append(Throttle(DOOR_KEY, o.server_pid, False))
+            throttled = None
+    elif o.exists:
+        condition, throttled = "NOT_RUNNING", None
+    else:
+        throttled = None
+        after = _after_restart(h, now)
+        if after is not None:
+            condition = after.value
+        elif not o.trusted:
+            condition = "UNTRUSTED"
+        elif len(recent) < MAX_RESTARTS_PER_HOUR:
+            actions.append(StartDoor(d.session, d.dir, tuple(argv)))
+            recent = recent + (now,)
+            condition, last = "RESTARTED", State.STARTING
+        else:
+            condition = "GAVE_UP"
+    return tuple(actions), condition, replace(h, restarts=recent, last_state=last, throttled_pid=throttled)
+
+
 # --- what a watch run does -------------------------------------------------------------
 
 MAX_RESTARTS_PER_HOUR = 3
@@ -423,14 +525,26 @@ REASONS = {
 }
 
 
+DOOR_REASONS = {"NOT_RUNNING": "its tmux session runs something else"}
+
+
+def _display(name: str) -> str:
+    return "door" if name == DOOR_KEY else name
+
+
+def _reason(name: str, condition: str) -> str:
+    return DOOR_REASONS.get(condition, REASONS[condition]) if name == DOOR_KEY else REASONS[condition]
+
+
 def _new_trouble(prev: Dict[str, str], now: Dict[str, str]) -> List[str]:
-    return [f"{n} ({REASONS[c]})" for n, c in now.items() if c in NEEDS_YOU and prev.get(n) != c]
+    return [f"{_display(n)} ({_reason(n, c)})" for n, c in now.items() if c in NEEDS_YOU and prev.get(n) != c]
 
 
 def diff_changes(prev: Dict[str, str], now: Dict[str, str]) -> Optional[str]:
     """One line per run for watch.log: restarts, new problems, recoveries. None when nothing changed."""
-    restarted = [n for n, c in now.items() if c == "RESTARTED" and prev.get(n) != "RESTARTED"]
-    back = [n for n, c in now.items() if c == "OK" and (prev.get(n) in NEEDS_YOU or prev.get(n) in ("RESTARTED", "STARTING"))]
+    restarted = [_display(n) for n, c in now.items() if c == "RESTARTED" and prev.get(n) != "RESTARTED"]
+    back = [_display(n) for n, c in now.items()
+            if c == "OK" and (prev.get(n) in NEEDS_YOU or prev.get(n) in ("RESTARTED", "STARTING"))]
     groups = [("restarted", restarted), ("needs you", _new_trouble(prev, now)), ("back", back)]
     if not any(items for _, items in groups):
         return None
@@ -546,14 +660,16 @@ def format_report(rows: List[ReportRow], problems: Sequence[str] = ()) -> Tuple[
 
 # --- seeding the manifest ----------------------------------------------------------------
 
-def adopt(entries: List[Entry], records: List[Record], default_flags: Tuple[str, ...]) -> Tuple[List[Entry], List[str]]:
+def adopt(entries: List[Entry], records: List[Record], default_flags: Tuple[str, ...],
+          exclude: frozenset = frozenset({DOOR_SESSION})) -> Tuple[List[Entry], List[str]]:
     """Add live tmux hosts the manifest does not know yet. Never rewrites an existing entry;
-    notes when a host runs a different conversation than the one pinned."""
+    notes when a host runs a different conversation than the one pinned. Sessions the door
+    spawns inherit its tmux session name; they are the door's, never adopted."""
     by_name = {e.name: e for e in entries}
     out = list(entries)
     notes: List[str] = []
     for r in records:
-        if not r.alive or not r.tmux_session:
+        if not r.alive or not r.tmux_session or r.tmux_session in exclude:
             continue
         known = by_name.get(r.tmux_session)
         if known is None:

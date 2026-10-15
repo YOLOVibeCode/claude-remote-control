@@ -8,18 +8,27 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from claude_rc.core import (  # noqa: E402
+    DOOR_KEY,
     ChannelHealth,
+    DoorConfig,
+    DoorObservation,
     Entry,
     PaneInfo,
     Policy,
+    StartDoor,
+    Throttle,
     History,
     Record,
     State,
     classify,
     coalesce_queue,
+    door_argv,
     input_is_empty,
+    is_door_command,
     is_night,
+    parse_door,
     parse_policy,
+    plan_door,
     restart_argv,
     stop_blocker,
     track_delivery,
@@ -228,6 +237,67 @@ class IsNightTest(unittest.TestCase):
 
     def test_equal_bounds_is_never_night(self):
         self.assertFalse(any(is_night(Policy(night_start_hour=3, night_end_hour=3), h) for h in range(24)))
+
+
+class DoorConfigTest(unittest.TestCase):
+    def test_defaults_ask_before_commands(self):
+        d, warnings = parse_door(None)
+        self.assertEqual((d.enabled, d.session, d.spawn, d.capacity, d.permission_mode), (False, "remote", "same-dir", 2, "acceptEdits"))
+        self.assertEqual(warnings, [])
+
+    def test_bad_values_fall_back(self):
+        d, warnings = parse_door({"spawn": "everywhere", "capacity": 99, "session": "re mote", "permission_mode": "a b"})
+        self.assertEqual(d, DoorConfig())
+        self.assertEqual(len(warnings), 4)
+
+    def test_argv_is_ccserve_plus_spawn_and_capacity(self):
+        self.assertEqual(door_argv(DoorConfig(), "/bin/claude", "mac"),
+                         ["/bin/claude", "remote-control", "--name", "mac", "--spawn", "same-dir", "--capacity", "2",
+                          "--permission-mode", "acceptEdits"])
+
+    def test_session_spawn_has_no_capacity(self):
+        self.assertNotIn("--capacity", door_argv(DoorConfig(spawn="session"), "claude", "mac"))
+
+    def test_only_the_server_command_is_the_door(self):
+        self.assertTrue(is_door_command("/Users/x/.local/bin/claude remote-control --name mac"))
+        self.assertFalse(is_door_command("/Users/x/.local/bin/claude --remote-control remote-control"))
+        self.assertFalse(is_door_command("-zsh"))
+        self.assertFalse(is_door_command(""))
+
+
+class PlanDoorTest(unittest.TestCase):
+    ON = DoorConfig(enabled=True)
+    ARGV = ["claude", "remote-control"]
+
+    def test_disabled_has_no_condition(self):
+        self.assertEqual(plan_door(DoorConfig(), DoorObservation(False, None), History(), NOW, self.ARGV, False),
+                         ((), None, History()))
+
+    def test_running_is_ok(self):
+        actions, cond, _ = plan_door(self.ON, DoorObservation(True, 77), History(), NOW, self.ARGV, False)
+        self.assertEqual((actions, cond), ((), "OK"))
+
+    def test_down_is_started_with_its_argv(self):
+        actions, cond, h = plan_door(self.ON, DoorObservation(False, None), History(), NOW, self.ARGV, False)
+        self.assertEqual((actions, cond, h.restarts), ((StartDoor("remote", "~/Dev", tuple(self.ARGV)),), "RESTARTED", (NOW,)))
+
+    def test_backs_off_after_three_an_hour(self):
+        h = History(restarts=(NOW - 3000, NOW - 2000, NOW - 1000), last_state=State.OK)
+        self.assertEqual(plan_door(self.ON, DoorObservation(False, None), h, NOW, self.ARGV, False)[1], "GAVE_UP")
+
+    def test_a_session_running_something_else_is_reported_never_touched(self):
+        actions, cond, _ = plan_door(self.ON, DoorObservation(True, None), History(), NOW, self.ARGV, False)
+        self.assertEqual((actions, cond), ((), "NOT_RUNNING"))
+
+    def test_an_untrusted_folder_is_not_started(self):
+        self.assertEqual(plan_door(self.ON, DoorObservation(False, None, trusted=False), History(), NOW, self.ARGV, False)[1],
+                         "UNTRUSTED")
+
+    def test_background_at_night_and_back_by_day(self):
+        actions, _, h = plan_door(self.ON, DoorObservation(True, 77), History(), NOW, self.ARGV, True)
+        self.assertEqual(actions, (Throttle(DOOR_KEY, 77, True),))
+        actions, _, h = plan_door(self.ON, DoorObservation(True, 77), h, NOW, self.ARGV, False)
+        self.assertEqual(actions, (Throttle(DOOR_KEY, 77, False),))
 
 
 class DeliveryHealthTest(unittest.TestCase):

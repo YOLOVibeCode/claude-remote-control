@@ -32,9 +32,12 @@ from dataclasses import replace
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Set, TextIO, Tuple
 
 from .core import (
+    DOOR_KEY,
     ESCALATE_AFTER,
     NEEDS_YOU,
     ChannelHealth,
+    DoorConfig,
+    DoorObservation,
     Policy,
     RESTART_GRACE_S,
     Entry,
@@ -44,6 +47,7 @@ from .core import (
     Relink,
     ReportRow,
     Restart,
+    StartDoor,
     State,
     Stop,
     Throttle,
@@ -52,10 +56,13 @@ from .core import (
     coalesce_queue,
     diff_alerts,
     diff_changes,
+    door_argv,
     input_is_empty,
     format_report,
+    is_door_command,
     is_night,
     plan,
+    plan_door,
     restart_argv,
     stop_blocker,
     track_delivery,
@@ -120,7 +127,8 @@ class App:
                  text: Channel, mail: Channel, out: TextIO = sys.stdout, sleep: Callable[[float], None] = time.sleep,
                  trust=None, heartbeat: Optional[Callable[[], object]] = None, hostname: str = "",
                  health=None, local=None, policy: Optional[Policy] = None, qos=None,
-                 local_hour: Optional[Callable[[float], int]] = None, config_warnings: Sequence[str] = ()):
+                 local_hour: Optional[Callable[[float], int]] = None, config_warnings: Sequence[str] = (),
+                 door: Optional[DoorConfig] = None, procs=None, door_name: str = ""):
         from .adapters.files import JsonHealthStore
         from .adapters.qos import NoThrottle
         from .notify.local import NoNotifier
@@ -137,6 +145,12 @@ class App:
         self.policy = replace(policy, throttle_at_night=policy.throttle_at_night and bool(getattr(self.qos, "enabled", False)))
         self.local_hour = local_hour or (lambda t: time.localtime(t).tm_hour)
         self.config_warnings = list(config_warnings)
+        self.door = door or DoorConfig()
+        self.door_name = door_name or (hostname or "mac").lower()
+        if procs is None:
+            from .adapters.procs import PsProcesses
+            procs = PsProcesses()
+        self.procs = procs
 
     # --- helpers ----------------------------------------------------------------------------
     def log(self, line: str) -> None:
@@ -263,7 +277,7 @@ class App:
     # --- commands ---------------------------------------------------------------------------
     def adopt(self, quiet: bool = False) -> int:
         entries = self.manifest.load()
-        new, notes = adopt(entries, self.registry.live_sessions(), DEFAULT_FLAGS)
+        new, notes = adopt(entries, self.registry.live_sessions(), DEFAULT_FLAGS, frozenset({self.door.session}))
         if new != entries:
             self.manifest.save(new)
         for n in notes:
@@ -398,28 +412,39 @@ class App:
     def check(self, as_json: bool = False) -> int:
         _, histories, _ = self.state.load()
         self._health = self.health.load()
-        rows = self._observe(self.manifest.load(), histories)
+        _, names = self._session_names()
+        rows = self._observe(self._without_door(self.manifest.load()), histories, names)
+        door_condition = self._door_plan(names, histories, self.clock.now(), False)[1]
         data = [{"name": o.entry.name, "state": o.state.value, "conversation": o.entry.conversation,
                  "linked": bool(r and r.linked), "status": o.status, "version": r.version if r else None,
                  "trusted": o.trusted, "tier": o.entry.tier,
                  "parked_reason": histories.get(o.entry.name, History()).parked_reason if o.state is State.PARKED else None}
                 for o, r in rows]
+        if door_condition is not None:
+            door_state = "OK" if door_condition == "OK" else ("DEAD" if door_condition in ("RESTARTED", "GAVE_UP") else door_condition)
+            data.append({"name": DOOR_KEY, "kind": "door", "state": door_state, "session": self.door.session,
+                         "dir": self.door.dir, "permission_mode": self.door.permission_mode})
         if as_json:
             json.dump(data, self.out, indent=2)
             self.out.write("\n")
         else:
             night = self.policy.enabled and is_night(self.policy, self.local_hour(self.clock.now()))
             print(self._profile_line(night, sum(1 for o, _ in rows if o.state in (State.OK, State.UNLINKED))), file=self.out)
+            if door_condition is not None:
+                print(f"door: {data[-1]['state']} (tmux session {self.door.session}, {self.door.permission_mode})", file=self.out)
             for w in self._problems():
                 print(f"attention: {w}", file=self.out)
             for d in data:
+                if d.get("kind") == "door":
+                    continue
                 print(f"{d['state']:<19} {d['name']:<24} {d['conversation'][:8]}  "
                       f"{'linked' if d['linked'] else 'no-link'}  {d['status'] or '-'}"
                       f"{'  keep' if d['tier'] == 'keep' else ''}"
                       f"{'  (' + d['parked_reason'] + ')' if d['parked_reason'] else ''}"
                       f"{'' if d['trusted'] else '  (folder not trusted: restart would stop at the prompt)'}", file=self.out)
         fine = {State.OK, State.DISABLED, State.STARTING, State.PARKED}
-        return 0 if all(o.state in fine for o, _ in rows) else 1
+        door_ok = door_condition in (None, "OK", "STARTING")
+        return 0 if door_ok and all(o.state in fine for o, _ in rows) else 1
 
     def watch(self) -> int:
         with self.locked() as got:
@@ -471,7 +496,7 @@ class App:
         rotate(os.path.join(self.home, "launchd.log"))
         prev, histories, queued = self.state.load()
         self._health = self.health.load()
-        entries = self.manifest.load()
+        entries = self._without_door(self.manifest.load())
         answered, names = self._session_names()
         if not answered:  # tmux hung: act on nothing, keep what we knew, still tell the outside we ran
             if self._track("tmux", "tmux did not answer list-sessions") == "failing":
@@ -484,8 +509,13 @@ class App:
         now = self.clock.now()
         night = self.policy.enabled and is_night(self.policy, self.local_hour(now))
         rows = self._observe(entries, histories, names)
+        loaded = histories
         d = plan([o for o, _ in rows], histories, now, self.claude_bin, self.policy, night)
         conditions, histories = dict(d.conditions), dict(d.histories)
+        # plan() only returns hosts; the door's own history (restarts, throttled pid) comes from the file.
+        door_actions, door_condition, door_history = self._door_plan(names, loaded, now, night)
+        if door_condition is not None:
+            conditions[DOOR_KEY], histories[DOOR_KEY] = door_condition, door_history
 
         # Stop first: free memory before anything starts.
         self._run_stops([a for a in d.actions if isinstance(a, Stop)], conditions, histories)
@@ -517,7 +547,10 @@ class App:
 
         if restarted:
             self._await_restarts(restarted, entries, conditions, histories)
-        self._run_throttles([a for a in d.actions if isinstance(a, Throttle)], histories)
+        for a in door_actions:
+            if isinstance(a, StartDoor):
+                self._start_door(a, conditions, histories)
+        self._run_throttles([a for a in tuple(d.actions) + door_actions if isinstance(a, Throttle)], histories)
         for n, c in conditions.items():
             if c == "PARKED" and prev.get(n) != "PARKED":
                 h = histories.get(n, History())
@@ -539,18 +572,72 @@ class App:
         self.health.save(self._health)
         return 0
 
+    # --- the door -----------------------------------------------------------------------------
+    def _without_door(self, entries: List[Entry]) -> List[Entry]:
+        """A manifest entry named like the door's session would fight the door: ignore it, say so once."""
+        kept = [e for e in entries if e.name != self.door.session]
+        if len(kept) != len(entries) and not any("named like the door" in w for w in self.config_warnings):
+            self.config_warnings.append(f"manifest entry '{self.door.session}' is named like the door's tmux "
+                                        f"session; ignored (rename or remove it)")
+        return kept
+
+    def _door_pid(self) -> Optional[int]:
+        pane = self.mux.pane_info(self.door.session)
+        if pane is None or pane.dead:
+            return None
+        return pane.pid if is_door_command(self.procs.command(pane.pid)) else None
+
+    def _observe_door(self, names: Optional[Set[str]]) -> DoorObservation:
+        d = self.door
+        exists = (d.session in names) if names is not None else self.mux.has_session(d.session)
+        trusted = self.trust.trusted(d.dir) if self.trust is not None else True
+        return DoorObservation(exists, self._door_pid() if exists else None, trusted)
+
+    def _door_plan(self, names: Optional[Set[str]], histories: Dict[str, History], now: float, night: bool):
+        if not self.door.enabled:
+            return (), None, History()
+        background = self.policy.enabled and night and self.policy.throttle_at_night
+        return plan_door(self.door, self._observe_door(names), histories.get(DOOR_KEY, History()), now,
+                         door_argv(self.door, self.claude_bin, self.door_name), background)
+
+    def _start_door(self, a: StartDoor, conditions: Dict[str, str], histories: Dict[str, History]) -> None:
+        try:
+            self.mux.new_session(a.session, a.dir, a.argv)
+        except RuntimeError as e:
+            conditions[DOOR_KEY] = "RESTART_FAILED"
+            histories[DOOR_KEY] = replace(histories[DOOR_KEY], last_state=State.RESTART_FAILED)
+            self.log(f"door start failed: {e}")
+            return
+        for _ in range(int(RESTART_GRACE_S // POLL_S) + 1):
+            if self._door_pid() is not None:
+                return
+            self.sleep(POLL_S)
+        conditions[DOOR_KEY] = "RESTART_FAILED"
+        histories[DOOR_KEY] = replace(histories[DOOR_KEY], last_state=State.RESTART_FAILED)
+        pane = self.mux.capture(a.session, 20).strip().splitlines()[-8:]
+        self.log("door did not start; pane: " + " | ".join(pane))
+
     def _run_throttles(self, throttles: List[Throttle], histories: Dict[str, History]) -> None:
         """Apply background/foreground priority, only to the pid that is still the session's own process."""
         moved: Dict[bool, List[str]] = {True: [], False: []}
         for a in throttles:
-            pane = self.mux.pane_info(a.name)
-            done = pane is not None and pane.pid == a.pid and self.qos.background(a.pid, a.on)
+            if a.name == DOOR_KEY:
+                ok = self._door_pid() == a.pid
+                pane = None
+                done = ok and self.qos.background(a.pid, a.on)
+                if done and not a.on:
+                    for child in self.procs.descendants(a.pid):  # sessions the door started at night
+                        self.qos.background(child, False)
+            else:
+                pane = self.mux.pane_info(a.name)
+                done = pane is not None and pane.pid == a.pid and self.qos.background(a.pid, a.on)
             h = histories.get(a.name)
             if done:
-                moved[a.on].append(a.name)
+                moved[a.on].append("door" if a.name == DOOR_KEY else a.name)
             elif h is not None:
                 # Not applied: remember the truth so the next run tries again (or forgets a gone pid).
-                histories[a.name] = replace(h, throttled_pid=None if a.on or pane is None or pane.pid != a.pid else h.throttled_pid)
+                gone = pane is None or pane.pid != a.pid if a.name != DOOR_KEY else self._door_pid() != a.pid
+                histories[a.name] = replace(h, throttled_pid=None if a.on or gone else h.throttled_pid)
         if moved[True]:
             self.log("background priority: " + ", ".join(moved[True]))
         if moved[False]:
@@ -575,8 +662,11 @@ class App:
         hour = self.local_hour(now) if at_hour is None else at_hour
         pol = replace(self.policy, enabled=True)
         night = is_night(pol, hour)
-        rows = self._observe(self.manifest.load(), histories, names)
+        rows = self._observe(self._without_door(self.manifest.load()), histories, names)
         d = plan([o for o, _ in rows], histories, now, self.claude_bin, pol, night)
+        dc = replace(self.door, enabled=True)  # show what the door would do even while it is off
+        door_cond = plan_door(dc, self._observe_door(names), histories.get(DOOR_KEY, History()), now,
+                              door_argv(dc, self.claude_bin, self.door_name), night and pol.throttle_at_night)[1]
         by_pid = {r.pid: r for r in self.registry.live_sessions()}
         acts: Dict[str, List[object]] = {}
         for a in d.actions:
@@ -609,6 +699,7 @@ class App:
         starts = sum(1 for r in out if r["would"] == "restart")
         if as_json:
             json.dump({"profile": "night" if night else "day", "hour": hour, "policy_enabled": self.policy.enabled,
+                       "door": {"enabled": self.door.enabled, "would": door_cond},
                        "live_now": live_now, "live_after": live_now - parks + starts, "rows": out,
                        "warnings": self.config_warnings}, self.out, indent=2)
             self.out.write("\n")
@@ -617,6 +708,10 @@ class App:
               + ("" if self.policy.enabled else "  (policy is OFF in config.json: showing what enabling it would do)"),
               file=self.out)
         print(f"live hosts: {live_now} now -> {live_now - parks + starts} after", file=self.out)
+        door_note = {"OK": "running", "RESTARTED": "would be started", "NOT_RUNNING": "its tmux session runs something else"}
+        print(f"door ({'on' if self.door.enabled else 'off in config.json'}): "
+              f"{door_note.get(door_cond, door_cond)}: {' '.join(door_argv(self.door, 'claude', self.door_name)[1:])}",
+              file=self.out)
         print(f"{'NAME':<24} {'STATE':<15} {'TIER':<5} {'STATUS':<8} {'IDLE':<8} {'WOULD':<16} BLOCKED", file=self.out)
         for r in out:
             print(f"{r['name']:<24} {r['state']:<15} {r['tier']:<5} {r['status']:<8} {r['idle']:<8} {r['would']:<16} {r['blocked']}",
@@ -630,10 +725,19 @@ class App:
         sender = self.heartbeat() if self.heartbeat else None
         if sender is None:
             return
+        hosts = {n: c for n, c in conditions.items() if not n.startswith("@")}
         payload = {"source": "claude-rc", "host": self.hostname,
-                   "ok": sum(1 for c in conditions.values() if c == "OK"),
-                   "total": len(conditions),
+                   "ok": sum(1 for c in hosts.values() if c == "OK"),
+                   "total": len(hosts),
                    "needs_you": sum(1 for c in conditions.values() if c in NEEDS_YOU)}
+        parked = sum(1 for c in hosts.values() if c == "PARKED")
+        if self.policy.enabled or parked:
+            payload["parked"] = parked
+        if self.door.enabled:
+            payload["door"] = conditions.get(DOOR_KEY, "unknown")
+        failing = sorted(c for c, h in self._health.items() if h.failures)
+        if failing:
+            payload["failing"] = failing
         try:
             sender.beat(payload)  # type: ignore[attr-defined]
         except DeliveryError as e:
@@ -685,7 +789,12 @@ class App:
         self._health = self.health.load()
         now = self.clock.now()
         rows = []
-        for o, r in self._observe(self.manifest.load(), histories):
+        door_condition = self._door_plan(self._session_names()[1], histories, now, False)[1]
+        if door_condition is not None:
+            h = histories.get(DOOR_KEY, History())
+            rows.append(ReportRow("door", "OK" if door_condition == "OK" else door_condition, "", door_condition == "OK",
+                                  self.door.permission_mode, sum(1 for t in h.restarts if now - t < 86400), self.door.dir))
+        for o, r in self._observe(self._without_door(self.manifest.load()), histories):
             h = histories.get(o.entry.name, History())
             rows.append(ReportRow(o.entry.name, o.state.value, o.entry.conversation, bool(r and r.linked),
                                   r.version if r else "-", sum(1 for t in h.restarts if now - t < 86400), o.entry.dir,
@@ -764,8 +873,12 @@ def build_app(home: Optional[str] = None) -> App:
     except ValueError as e:  # a typo in config.json must not stop the watchdog
         print(f"claude-rc: config.json is not valid JSON ({e}); using defaults", file=sys.stderr)
         config = {}
-    from .core import parse_policy
+    from .core import parse_door, parse_policy
     policy, warnings = parse_policy(config.get("policy"))
+    door, door_warnings = parse_door(config.get("door"))
+    warnings += door_warnings
+    door = replace(door, dir=os.path.expanduser(door.dir))
+    host = socket.gethostname().split(".")[0]
     env = dict(os.environ)
     env.update(_load_secrets(os.path.join(home, "secrets.env")))
 
@@ -800,7 +913,8 @@ def build_app(home: Optional[str] = None) -> App:
     from .notify.local import MacNotification
 
     mux = TmuxMultiplexer()
-    app = App(local=MacNotification(), policy=policy, qos=TaskPolicy(), config_warnings=warnings, home=home, registry=FileSessionRegistry(registry_dir), mux=mux,
+    app = App(local=MacNotification(), policy=policy, qos=TaskPolicy(), config_warnings=warnings, door=door,
+              door_name=door.name or host.lower(), home=home, registry=FileSessionRegistry(registry_dir), mux=mux,
                manifest=JsonManifestStore(os.path.join(home, "sessions.json")),
                state=JsonStateStore(os.path.join(home, "state.json")), clock=_Clock(), claude_bin=_claude_bin(),
                text=channel("alerts", build_text_sender), mail=channel("report", build_email_sender),

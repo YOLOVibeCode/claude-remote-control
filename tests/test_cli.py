@@ -13,11 +13,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from claude_rc.adapters.files import JsonManifestStore, JsonStateStore  # noqa: E402
 from claude_rc.cli import App, flags_to_record  # noqa: E402
-from claude_rc.core import Entry, PaneInfo, Policy, Record  # noqa: E402
+from claude_rc.core import DoorConfig, Entry, PaneInfo, Policy, Record  # noqa: E402
 from claude_rc.ports import DeliveryError  # noqa: E402
 
 CONV = "11111111-1111-1111-1111-111111111111"
 BIN = "/bin/claude"
+
+
+class FakeProcs:
+    def __init__(self):
+        self.commands, self.children = {}, {}
+
+    def alive(self, pid):
+        return pid in self.commands
+
+    def command(self, pid):
+        return self.commands.get(pid, "")
+
+    def descendants(self, pid):
+        return list(self.children.get(pid, []))
 
 
 class FakeRegistry:
@@ -32,6 +46,7 @@ class FakeMux:
     def __init__(self, registry, comes_up=True):
         self.sessions, self.calls, self.registry, self.comes_up = set(), [], registry, comes_up
         self.copy_mode, self.keys_fail, self.hung = set(), False, False
+        self.pane_pids, self.procs = {}, FakeProcs()
 
     def has_session(self, name):
         return name in self.sessions
@@ -42,7 +57,7 @@ class FakeMux:
     def pane_info(self, name):
         if name not in self.sessions:
             return None
-        pid = next((r.pid for r in self.registry.records if r.tmux_session == name and r.alive), 1)
+        pid = self.pane_pids.get(name) or next((r.pid for r in self.registry.records if r.tmux_session == name and r.alive), 1)
         return PaneInfo(pid, name in self.copy_mode, False, 1, 1)
 
     def kill_session(self, name):
@@ -50,12 +65,19 @@ class FakeMux:
         self.sessions.discard(name)
         return True
 
+    door_pid = 777
+
     def new_session(self, name, directory, argv):
         self.calls.append(("new", name, directory, tuple(argv)))
         self.sessions.add(name)
-        if self.comes_up:  # claude starts and registers on the resumed conversation
+        if not self.comes_up:
+            return
+        if "--resume" in argv:  # claude starts and registers on the resumed conversation
             conv = argv[argv.index("--resume") + 1]
             self.registry.records.append(Record(99, conv, directory, name, "idle", True, "2.1.291", True))
+        else:                   # the door: the pane's process is the Remote Control server
+            self.pane_pids[name] = self.door_pid
+            self.procs.commands[self.door_pid] = " ".join(argv)
 
     exit_works = True
 
@@ -153,7 +175,7 @@ class AppTest(unittest.TestCase):
                     trust=self.trust,
                     clock=self.clock, claude_bin=BIN, text=lambda: (self.text, "+15125550100"),
                     mail=lambda: (self.mail, "me@example.com"), out=self.out, sleep=lambda s: None,
-                    heartbeat=lambda: self.beats, hostname="mac", local=self.notifier)
+                    heartbeat=lambda: self.beats, hostname="mac", local=self.notifier, procs=self.mux.procs)
         base.update(kw)
         return App(**base)
 
@@ -367,6 +389,68 @@ class AppTest(unittest.TestCase):
         out = self.out.getvalue()
         self.assertIn("policy: on, day profile", out)
         self.assertIn("attention: config: policy.x", out)
+
+    # door -----------------------------------------------------------------------------------
+    DOOR = DoorConfig(enabled=True, dir="/w/Dev")
+
+    def test_watch_starts_the_door_when_enabled_and_down(self):
+        self.app(door=self.DOOR).watch()
+        self.assertEqual(self.mux.calls[0], ("new", "remote", "/w/Dev", (
+            BIN, "remote-control", "--name", "mac", "--spawn", "same-dir", "--capacity", "2",
+            "--permission-mode", "acceptEdits")))
+        self.assertIn("restarted door", self.log())
+        self.clock.t += 600
+        self.app(door=self.DOOR).watch()
+        self.assertEqual(len([c for c in self.mux.calls if c[0] == "new"]), 1)  # running: left alone
+
+    def test_the_door_keeps_its_history_between_runs(self):
+        self.app(door=self.DOOR).watch()
+        self.clock.t += 600
+        self.app(door=self.DOOR).watch()
+        _, histories, _ = self.state.load()
+        self.assertEqual(histories["@door"].restarts, (1_000_000.0,))
+
+    def test_a_foreign_remote_session_is_reported_and_left_alone(self):
+        self.mux.sessions.add("remote")
+        self.mux.pane_pids["remote"] = 555
+        self.mux.procs.commands[555] = "-zsh"
+        self.app(door=self.DOOR).watch()
+        self.assertEqual(self.mux.calls, [])
+        self.assertIn("door (its tmux session runs something else)", self.text.sent[-1][1])
+
+    def test_a_disabled_door_does_nothing(self):
+        self.app().watch()
+        self.assertEqual(self.mux.calls, [])
+        self.assertNotIn("door", self.beats.sent[-1])
+
+    def test_the_door_shows_in_check_json_and_the_heartbeat(self):
+        self.app(door=self.DOOR).watch()
+        self.assertEqual(self.beats.sent[-1]["door"], "RESTARTED")
+        self.app(door=self.DOOR).check(as_json=True)
+        door = [r for r in json.loads(self.out.getvalue()) if r.get("kind") == "door"][0]
+        self.assertEqual((door["state"], door["permission_mode"]), ("OK", "acceptEdits"))
+
+    def test_sessions_the_door_spawns_are_never_adopted(self):
+        self.reg.records = [Record(5, CONV, "/w/Dev", "remote", "idle", True, "2.1.300", True)]
+        self.app().adopt()
+        self.assertEqual(self.manifest.load(), [])
+
+    def test_a_manifest_entry_named_like_the_door_is_ignored_with_a_warning(self):
+        self.manifest.save([Entry("remote", "/w/x", CONV)])
+        self.app(door=self.DOOR).watch()
+        self.assertEqual([c for c in self.mux.calls if c[1] == "remote" and "--resume" in c[3]], [])
+        self.app(door=self.DOOR).check()
+        self.assertIn("named like the door", self.out.getvalue())
+
+    def test_night_moves_the_door_to_background_and_morning_restores_it_and_its_sessions(self):
+        qos, on = FakeQos(), Policy(enabled=True)
+        self.app(door=self.DOOR, policy=on, qos=qos, local_hour=lambda t: 1).watch()   # starts it
+        self.clock.t += 600
+        self.app(door=self.DOOR, policy=on, qos=qos, local_hour=lambda t: 1).watch()   # night: background
+        self.mux.procs.children[777] = [778, 779]                                       # sessions started overnight
+        self.clock.t += 600
+        self.app(door=self.DOOR, policy=on, qos=qos, local_hour=lambda t: 7).watch()   # morning
+        self.assertEqual(qos.calls, [(777, True), (777, False), (778, False), (779, False)])
 
     # watch ----------------------------------------------------------------------------------
     def test_watch_restarts_a_dead_host_and_logs_restart_then_return_without_texting(self):
