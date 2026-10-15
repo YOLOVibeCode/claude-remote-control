@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # A restarted host gets this long to register on its conversation before it counts as failed.
 RESTART_GRACE_S = 90
@@ -222,6 +222,42 @@ def _fit(prefix: str, groups: List[Tuple[str, List[str]]], limit: int) -> str:
     return render(shown, 0)
 
 
+# --- is the phone still hearing from us? ------------------------------------------------------
+
+ESCALATE_AFTER = 3  # consecutive failed runs before a channel is escalated (once)
+
+
+@dataclass(frozen=True)
+class ChannelHealth:
+    """Delivery record for one channel (alerts, heartbeat, report)."""
+    failures: int = 0                # consecutive failed runs
+    since: Optional[float] = None    # when the current failure streak started
+    last_error: str = ""
+    escalated: bool = False
+
+
+def track_delivery(h: ChannelHealth, error: Optional[str], now: float,
+                   after: int = ESCALATE_AFTER) -> Tuple[ChannelHealth, Optional[str]]:
+    """Update a channel's health after one attempt. The event is "failing" (first failure),
+    "escalate" (the streak reached `after`, reported once), "recovered", or None."""
+    if error is None:
+        return (ChannelHealth(), "recovered") if h.failures else (h, None)
+    new = ChannelHealth(h.failures + 1, h.since if h.since is not None else now, error[:200], h.escalated)
+    if new.failures >= after and not h.escalated:
+        return replace(new, escalated=True), "escalate"
+    return new, ("failing" if new.failures == 1 else None)
+
+
+def coalesce_queue(queued: List[str], limit: int) -> Tuple[List[str], List[str]]:
+    """Keep the newest alerts within `limit`, folding the rest into one summary line.
+    Returns (kept, dropped) so the caller can log what was folded."""
+    if len(queued) <= limit:
+        return list(queued), []
+    keep = max(0, limit - 1)
+    dropped = list(queued[:len(queued) - keep])
+    return [f"claude-rc: {len(dropped)} earlier alerts not delivered (see watch.log)"] + list(queued[len(queued) - keep:]), dropped
+
+
 @dataclass(frozen=True)
 class ReportRow:
     name: str
@@ -234,13 +270,19 @@ class ReportRow:
     trusted: bool = True
 
 
-def format_report(rows: List[ReportRow]) -> Tuple[str, str]:
-    """Daily all-clear email: (subject, html)."""
+def format_report(rows: List[ReportRow], problems: Sequence[str] = ()) -> Tuple[str, str]:
+    """Daily all-clear email: (subject, html). `problems` are things outside the sessions that
+    need a look, such as an alert channel that keeps failing."""
     from html import escape
 
     ok = sum(1 for r in rows if r.condition == "OK")
     need = sum(1 for r in rows if r.condition in NEEDS_YOU)
-    subject = f"claude-rc: {ok}/{len(rows)} OK" + (f", {need} need you" if need else "")
+    parked = sum(1 for r in rows if r.condition == "PARKED")
+    active = sum(1 for r in rows if r.condition not in ("PARKED", "DISABLED"))
+    subject = (f"claude-rc: {ok}/{active if parked else len(rows)} OK" + (f", {need} need you" if need else "")
+               + (f", {parked} parked" if parked else "") + (", alerts failing" if problems else ""))
+    attention = ("<p><b>Needs attention</b></p><ul>" + "".join(f"<li>{escape(p)}</li>" for p in problems) + "</ul>"
+                 if problems else "")
     cells = "".join(
         "<tr>"
         f"<td>{escape(r.name)}</td><td>{escape(r.condition)}</td><td><code>{escape(r.conversation[:8])}</code></td>"
@@ -251,6 +293,7 @@ def format_report(rows: List[ReportRow]) -> Tuple[str, str]:
     )
     html = (
         f"<p>{escape(subject)}</p>"
+        f"{attention}"
         "<table border='1' cellpadding='4' cellspacing='0'>"
         "<tr><th>session</th><th>state</th><th>conversation</th><th>linked</th><th>CLI</th><th>restarts 24h</th><th>folder</th></tr>"
         f"{cells}</table>"

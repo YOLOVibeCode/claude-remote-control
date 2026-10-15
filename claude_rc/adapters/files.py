@@ -6,7 +6,7 @@ import os
 import tempfile
 from typing import Dict, List, Tuple
 
-from ..core import Entry, History, State
+from ..core import ChannelHealth, Entry, History, State
 
 
 def write_private(path: str, data: object) -> None:
@@ -79,3 +79,23 @@ class JsonStateStore:
             },
             "queued": queued,
         })
+
+
+class JsonHealthStore:
+    """Per-channel delivery health (health.json): consecutive failures and whether it was escalated."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def load(self) -> Dict[str, ChannelHealth]:
+        data = read_json(self.path, {})
+        out: Dict[str, ChannelHealth] = {}
+        for name, h in (data.items() if isinstance(data, dict) else []):
+            if isinstance(h, dict):
+                out[name] = ChannelHealth(int(h.get("failures", 0)), h.get("since"), str(h.get("last_error", "")),
+                                          bool(h.get("escalated", False)))
+        return out
+
+    def save(self, health: Dict[str, ChannelHealth]) -> None:
+        write_private(self.path, {name: {"failures": h.failures, "since": h.since, "last_error": h.last_error,
+                                         "escalated": h.escalated} for name, h in health.items()})

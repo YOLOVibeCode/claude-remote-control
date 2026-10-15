@@ -10,7 +10,7 @@
     claude-rc notify-test alerts|report
 
 Files live in $CLAUDE_RC_HOME (default ~/.config/claude-rc): sessions.json (manifest),
-state.json, config.json (providers), secrets.env (0600), watch.log.
+state.json, health.json (delivery streaks), config.json (providers), secrets.env (0600), watch.log.
 """
 from __future__ import annotations
 
@@ -28,7 +28,9 @@ from dataclasses import replace
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, TextIO, Tuple
 
 from .core import (
+    ESCALATE_AFTER,
     NEEDS_YOU,
+    ChannelHealth,
     RESTART_GRACE_S,
     Entry,
     History,
@@ -40,11 +42,13 @@ from .core import (
     State,
     adopt,
     classify,
+    coalesce_queue,
     diff_alerts,
     diff_changes,
     input_is_empty,
     format_report,
     plan,
+    track_delivery,
 )
 from .ports import DeliveryError, EmailSender, TextSender
 
@@ -94,10 +98,17 @@ def flags_to_record(args: Sequence[str]) -> Tuple[str, ...]:
 class App:
     def __init__(self, home: str, registry, mux, manifest, state, clock, claude_bin: str,
                  text: Channel, mail: Channel, out: TextIO = sys.stdout, sleep: Callable[[float], None] = time.sleep,
-                 trust=None, heartbeat: Optional[Callable[[], object]] = None, hostname: str = ""):
+                 trust=None, heartbeat: Optional[Callable[[], object]] = None, hostname: str = "",
+                 health=None, local=None):
+        from .adapters.files import JsonHealthStore
+        from .notify.local import NoNotifier
+
         self.home, self.registry, self.mux, self.manifest, self.state = home, registry, mux, manifest, state
         self.trust, self.heartbeat, self.hostname = trust, heartbeat, hostname
         self.clock, self.claude_bin, self.text, self.mail, self.out, self.sleep = clock, claude_bin, text, mail, out, sleep
+        self.health = health if health is not None else JsonHealthStore(os.path.join(home, "health.json"))
+        self.local = local if local is not None else NoNotifier()
+        self._health: Dict[str, ChannelHealth] = {}
 
     # --- helpers ----------------------------------------------------------------------------
     def log(self, line: str) -> None:
@@ -212,6 +223,28 @@ class App:
                 traceback.print_exc(file=sys.stderr)
                 return 1
 
+    def _track(self, channel: str, error: Optional[str], after: int = ESCALATE_AFTER) -> Optional[str]:
+        """Record one delivery attempt; escalate a streak once, note a recovery once."""
+        cur = self._health.get(channel, ChannelHealth())
+        new, event = track_delivery(cur, error, self.clock.now(), after)
+        self._health[channel] = new
+        if event == "escalate":
+            since = time.strftime("%Y-%m-%d %H:%M", time.localtime(new.since or self.clock.now()))
+            msg = f"{channel} failing since {since} ({new.failures} runs): {new.last_error}"
+            shown = self.local.notify("claude-rc", msg)
+            self.log(f"escalated: {msg}" + ("" if shown else " (no local notification available)"))
+        elif event == "recovered":
+            self.log(f"{channel} delivered again after {cur.failures} failed runs")
+        return event
+
+    def _problems(self) -> List[str]:
+        out = []
+        for channel, h in sorted(self._health.items()):
+            if h.failures:
+                since = time.strftime("%Y-%m-%d %H:%M", time.localtime(h.since or self.clock.now()))
+                out.append(f"{channel} not delivered since {since} ({h.failures} runs): {h.last_error}")
+        return out
+
     def _relink_blocker(self, name: str) -> Optional[str]:
         """Why typing /remote-control into this pane is not safe right now, or None."""
         pane_info = getattr(self.mux, "pane_info", None)
@@ -226,6 +259,7 @@ class App:
         # launchd reopens launchd.log at every run, so rolling it between runs is safe.
         rotate(os.path.join(self.home, "launchd.log"))
         prev, histories, queued = self.state.load()
+        self._health = self.health.load()
         entries = self.manifest.load()
         rows = self._observe(entries, histories)
         now = self.clock.now()
@@ -266,9 +300,13 @@ class App:
         msg = diff_alerts(prev, conditions)
         if msg:
             queued = queued + [msg]
+        queued, dropped = coalesce_queue(queued, QUEUE_LIMIT)
+        if dropped:
+            self.log("alerts folded into a summary (queue full): " + " / ".join(dropped)[:1000])
         queued = self._deliver(queued)
-        self.state.save(conditions, histories, queued[-QUEUE_LIMIT:])
+        self.state.save(conditions, histories, queued)
         self._beat(conditions)
+        self.health.save(self._health)
         return 0
 
     def _beat(self, conditions: Dict[str, str]) -> None:
@@ -283,7 +321,10 @@ class App:
         try:
             sender.beat(payload)  # type: ignore[attr-defined]
         except DeliveryError as e:
-            self.log(f"heartbeat not delivered ({e})")
+            if self._track("heartbeat", str(e)) == "failing":
+                self.log(f"heartbeat not delivered ({e})")
+            return
+        self._track("heartbeat", None)
 
     def _await_restarts(self, names: List[str], entries: List[Entry], conditions: Dict[str, str],
                         histories: Dict[str, History]) -> None:
@@ -318,12 +359,15 @@ class App:
             try:
                 sender.send_text(to, msg)  # type: ignore[attr-defined]
             except DeliveryError as e:
-                self.log(f"alert not delivered ({e}); will retry")
+                if self._track("alerts", str(e)) == "failing":
+                    self.log(f"alert not delivered ({e}); will retry")
                 return queued[i:]
+        self._track("alerts", None)
         return []
 
     def report(self) -> int:
         _, histories, _ = self.state.load()
+        self._health = self.health.load()
         now = self.clock.now()
         rows = []
         for o, r in self._observe(self.manifest.load(), histories):
@@ -331,7 +375,7 @@ class App:
             rows.append(ReportRow(o.entry.name, o.state.value, o.entry.conversation, bool(r and r.linked),
                                   r.version if r else "-", sum(1 for t in h.restarts if now - t < 86400), o.entry.dir,
                                   o.trusted))
-        subject, html = format_report(rows)
+        subject, html = format_report(rows, self._problems())
         channel = self.mail()
         if channel is None:
             print("report: no email provider configured", file=self.out)
@@ -342,8 +386,12 @@ class App:
         except DeliveryError as e:
             self.log(f"report not delivered ({e})")
             print(f"report not delivered: {e}", file=self.out)
+            self._track("report", str(e), after=1)  # one report a day: say so on the first miss
+            self.health.save(self._health)
             return 1
         self.log(f"report sent: {subject}")
+        self._track("report", None)
+        self.health.save(self._health)
         return 0
 
     def notify_test(self, which: str) -> int:
@@ -427,8 +475,10 @@ def build_app(home: Optional[str] = None) -> App:
             return time.time()
 
     registry_dir = os.environ.get("CLAUDE_RC_REGISTRY") or os.path.expanduser("~/.claude/sessions")
+    from .notify.local import MacNotification
+
     mux = TmuxMultiplexer()
-    app = App(home=home, registry=FileSessionRegistry(registry_dir), mux=mux,
+    app = App(local=MacNotification(), home=home, registry=FileSessionRegistry(registry_dir), mux=mux,
                manifest=JsonManifestStore(os.path.join(home, "sessions.json")),
                state=JsonStateStore(os.path.join(home, "state.json")), clock=_Clock(), claude_bin=_claude_bin(),
                text=channel("alerts", build_text_sender), mail=channel("report", build_email_sender),

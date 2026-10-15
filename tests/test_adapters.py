@@ -12,12 +12,13 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from claude_rc.adapters.files import JsonManifestStore, JsonStateStore  # noqa: E402
+from claude_rc.adapters.files import JsonHealthStore, JsonManifestStore, JsonStateStore  # noqa: E402
 from claude_rc.adapters.registry import FileSessionRegistry  # noqa: E402
 from claude_rc.adapters.run import run_command  # noqa: E402
 from claude_rc.adapters.tmux import TmuxMultiplexer  # noqa: E402
 from claude_rc.adapters.trust import ClaudeJsonTrust  # noqa: E402
-from claude_rc.core import Entry, History, PaneInfo, Record, State, adopt  # noqa: E402
+from claude_rc.core import ChannelHealth, Entry, History, PaneInfo, Record, State, adopt  # noqa: E402
+from claude_rc.notify.local import MacNotification  # noqa: E402
 
 CONV = "11111111-1111-1111-1111-111111111111"
 OTHER = "22222222-2222-2222-2222-222222222222"
@@ -131,6 +132,31 @@ class FilesTest(unittest.TestCase):
         h = {"a": History(restarts=(1.0, 2.0), last_state=State.STARTING, idle_unlinked_runs=1, relinked_at=3.0)}
         store.save({"a": "RESTARTED"}, h, ["claude-rc: restarted a"])
         self.assertEqual(store.load(), ({"a": "RESTARTED"}, h, ["claude-rc: restarted a"]))
+
+
+class HealthStoreTest(unittest.TestCase):
+    def test_round_trips_and_a_missing_file_is_healthy(self):
+        store = JsonHealthStore(os.path.join(tempfile.mkdtemp(), "health.json"))
+        self.assertEqual(store.load(), {})
+        h = {"alerts": ChannelHealth(3, 1000.0, "relay: 503", True)}
+        store.save(h)
+        self.assertEqual(store.load(), h)
+        self.assertEqual(stat.S_IMODE(os.stat(store.path).st_mode), 0o600)
+
+
+class MacNotificationTest(unittest.TestCase):
+    def test_text_is_passed_as_arguments_not_script(self):
+        calls = []
+        n = MacNotification(run=lambda argv: (calls.append(argv), (0, ""))[1], enabled=True)
+        self.assertTrue(n.notify("claude-rc", 'alerts "failing" \\ since 05:00'))
+        argv = calls[0]
+        self.assertEqual(argv[-2:], ["claude-rc", 'alerts "failing" \\ since 05:00'])
+        self.assertNotIn("failing", " ".join(argv[:-2]))  # the text is never part of the script
+
+    def test_off_unless_enabled(self):
+        calls = []
+        self.assertFalse(MacNotification(run=lambda argv: (calls.append(argv), (0, ""))[1], enabled=False).notify("t", "b"))
+        self.assertEqual(calls, [])
 
 
 class TmuxTest(unittest.TestCase):

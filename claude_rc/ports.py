@@ -1,14 +1,14 @@
 """The seams. Each consumer depends only on the narrow interface it uses (ISP)."""
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 try:
     from typing import Protocol
 except ImportError:  # pragma: no cover - python < 3.8
     Protocol = object  # type: ignore
 
-from .core import Entry, History, Record
+from .core import ChannelHealth, Entry, History, PaneInfo, Record
 
 
 class SessionRegistry(Protocol):
@@ -17,9 +17,12 @@ class SessionRegistry(Protocol):
 
 class Multiplexer(Protocol):
     def has_session(self, name: str) -> bool: ...
+    def list_sessions(self) -> Optional[Set[str]]: ...  # None: tmux did not answer
+    def pane_info(self, name: str) -> Optional[PaneInfo]: ...
     def new_session(self, name: str, directory: str, argv: Sequence[str]) -> None: ...
     def send_keys(self, name: str, text: str) -> None: ...
     def capture(self, name: str, lines: int, ansi: bool = False) -> str: ...
+    def kill_session(self, name: str) -> bool: ...
 
 
 class ManifestStore(Protocol):
@@ -34,6 +37,15 @@ class StateStore(Protocol):
 
 class TrustSource(Protocol):
     def trusted(self, directory: str) -> bool: ...
+
+
+class HealthStore(Protocol):
+    def load(self) -> Dict[str, ChannelHealth]: ...
+    def save(self, health: Dict[str, ChannelHealth]) -> None: ...
+
+
+class LocalNotifier(Protocol):
+    def notify(self, title: str, body: str) -> bool: ...
 
 
 class Clock(Protocol):

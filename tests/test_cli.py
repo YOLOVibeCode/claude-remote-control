@@ -67,6 +67,15 @@ class FakeMux:
         return self.pane if ansi else "Workspace not trusted\n"
 
 
+class FakeNotifier:
+    def __init__(self):
+        self.shown = []
+
+    def notify(self, title, body):
+        self.shown.append((title, body))
+        return True
+
+
 class Clock:
     def __init__(self, t=1_000_000.0):
         self.t = t
@@ -120,13 +129,14 @@ class AppTest(unittest.TestCase):
                 return d not in outer.untrusted
 
         self.trust = Trust()
+        self.notifier = FakeNotifier()
 
     def app(self, **kw):
         base = dict(home=self.home, registry=self.reg, mux=self.mux, manifest=self.manifest, state=self.state,
                     trust=self.trust,
                     clock=self.clock, claude_bin=BIN, text=lambda: (self.text, "+15125550100"),
                     mail=lambda: (self.mail, "me@example.com"), out=self.out, sleep=lambda s: None,
-                    heartbeat=lambda: self.beats, hostname="mac")
+                    heartbeat=lambda: self.beats, hostname="mac", local=self.notifier)
         base.update(kw)
         return App(**base)
 
@@ -280,6 +290,55 @@ class AppTest(unittest.TestCase):
         self.app().watch()
         bodies = [b for _, b in self.text.sent]
         self.assertEqual(bodies, ["claude-rc: needs you app (wrong conversation)"])
+
+    def test_alert_failures_escalate_once_after_three_runs_without_per_run_spam(self):
+        self.pin_app()
+        self.mux.sessions.add("app")
+        self.reg.records = [Record(1, "other-conv", "/w/app", "app", "idle", True, "2.1.291", True)]
+        self.text.fail = True
+        for _ in range(5):
+            self.app().watch()
+            self.clock.t += 600
+        log = self.log()
+        self.assertEqual(log.count("alert not delivered"), 1)
+        self.assertEqual(log.count("escalated: alerts failing since"), 1)
+        self.assertEqual(len(self.notifier.shown), 1)
+        self.text.fail = False
+        self.app().watch()
+        self.assertIn("alerts delivered again after 5 failed runs", self.log())
+        self.assertEqual([b for _, b in self.text.sent], ["claude-rc: needs you app (wrong conversation)"])
+
+    def test_heartbeat_failures_escalate_once(self):
+        self.pin_app()
+        self.mux.sessions.add("app")
+        self.reg.records = [Record(1, CONV, "/w/app", "app", "idle", True, "2.1.291", True)]
+        self.beats.fail = True
+        for _ in range(4):
+            self.app().watch()
+            self.clock.t += 600
+        self.assertEqual(self.log().count("heartbeat not delivered"), 1)
+        self.assertEqual(self.log().count("escalated: heartbeat failing"), 1)
+
+    def test_a_full_queue_is_summarized_and_logged_not_dropped_silently(self):
+        self.pin_app()
+        self.state.save({}, {}, [f"claude-rc: old alert {i}" for i in range(25)])
+        self.text.fail = True
+        self.app().watch()
+        _, _, queued = self.state.load()
+        self.assertLessEqual(len(queued), 20)
+        self.assertTrue(queued[0].startswith("claude-rc: ") and "earlier alerts not delivered" in queued[0])
+        self.assertIn("alerts folded into a summary", self.log())
+
+    def test_the_report_lists_failing_delivery(self):
+        self.pin_app()
+        self.mux.sessions.add("app")
+        self.reg.records = [Record(1, CONV, "/w/app", "app", "idle", True, "2.1.291", True)]
+        self.beats.fail = True
+        self.app().watch()
+        self.assertEqual(self.app().report(), 0)
+        _, subject, html = self.mail.sent[0]
+        self.assertEqual(subject, "claude-rc: 1/1 OK, alerts failing")
+        self.assertIn("heartbeat not delivered since", html)
 
     def test_wrong_conversation_is_reported_and_never_touched(self):
         self.pin_app()

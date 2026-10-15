@@ -8,13 +8,16 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from claude_rc.core import (  # noqa: E402
+    ChannelHealth,
     Entry,
     History,
     Record,
     State,
     classify,
+    coalesce_queue,
     input_is_empty,
     restart_argv,
+    track_delivery,
 )
 
 CONV = "11111111-1111-1111-1111-111111111111"
@@ -117,6 +120,44 @@ class InputIsEmptyTest(unittest.TestCase):
 
     def test_no_prompt_at_all_is_not_safe_to_type_into(self):
         self.assertFalse(input_is_empty("$ \n"))
+
+
+class DeliveryHealthTest(unittest.TestCase):
+    def test_first_failure_is_failing_then_quiet(self):
+        h, ev = track_delivery(ChannelHealth(), "relay: 503", NOW)
+        self.assertEqual((h.failures, h.since, ev), (1, NOW, "failing"))
+        h, ev = track_delivery(h, "relay: 503", NOW + 600)
+        self.assertEqual((h.failures, h.since, ev), (2, NOW, None))
+
+    def test_escalates_once_at_the_threshold(self):
+        h = ChannelHealth()
+        events = []
+        for i in range(6):
+            h, ev = track_delivery(h, "relay: 503", NOW + 600 * i)
+            events.append(ev)
+        self.assertEqual(events, ["failing", None, "escalate", None, None, None])
+        self.assertTrue(h.escalated)
+
+    def test_success_after_failures_recovers_and_resets(self):
+        h, _ = track_delivery(ChannelHealth(), "x", NOW)
+        h, ev = track_delivery(h, None, NOW + 600)
+        self.assertEqual((h, ev), (ChannelHealth(), "recovered"))
+
+    def test_success_when_healthy_is_silent(self):
+        self.assertEqual(track_delivery(ChannelHealth(), None, NOW), (ChannelHealth(), None))
+
+    def test_a_threshold_of_one_escalates_the_first_failure(self):
+        self.assertEqual(track_delivery(ChannelHealth(), "smtp down", NOW, after=1)[1], "escalate")
+
+
+class CoalesceQueueTest(unittest.TestCase):
+    def test_under_the_limit_is_unchanged(self):
+        self.assertEqual(coalesce_queue(["a", "b"], 3), (["a", "b"], []))
+
+    def test_over_the_limit_keeps_the_newest_with_a_summary(self):
+        kept, dropped = coalesce_queue([str(i) for i in range(10)], 4)
+        self.assertEqual(kept, ["claude-rc: 7 earlier alerts not delivered (see watch.log)", "7", "8", "9"])
+        self.assertEqual(dropped, [str(i) for i in range(7)])
 
 
 if __name__ == "__main__":
