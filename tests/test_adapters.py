@@ -14,9 +14,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from claude_rc.adapters.files import JsonManifestStore, JsonStateStore  # noqa: E402
 from claude_rc.adapters.registry import FileSessionRegistry  # noqa: E402
+from claude_rc.adapters.run import run_command  # noqa: E402
 from claude_rc.adapters.tmux import TmuxMultiplexer  # noqa: E402
 from claude_rc.adapters.trust import ClaudeJsonTrust  # noqa: E402
-from claude_rc.core import Entry, History, Record, State, adopt  # noqa: E402
+from claude_rc.core import Entry, History, PaneInfo, Record, State, adopt  # noqa: E402
 
 CONV = "11111111-1111-1111-1111-111111111111"
 OTHER = "22222222-2222-2222-2222-222222222222"
@@ -86,6 +87,30 @@ class TrustTest(unittest.TestCase):
     def test_a_missing_file_trusts_everything_rather_than_blocking_restarts(self):
         self.assertTrue(ClaudeJsonTrust("/nonexistent/.claude.json").trusted("/w/x"))
 
+    def test_parses_once_until_the_file_changes(self):
+        p = os.path.join(tempfile.mkdtemp(), ".claude.json")
+        with open(p, "w") as f:
+            json.dump({"projects": {"/w/ok": {"hasTrustDialogAccepted": True}}}, f)
+        t = ClaudeJsonTrust(p)
+        parses = []
+        real_load = json.load
+
+        def counting_load(f):
+            parses.append(1)
+            return real_load(f)
+
+        json.load = counting_load
+        try:
+            for _ in range(5):
+                self.assertTrue(t.trusted("/w/ok"))
+            self.assertEqual(len(parses), 1)
+            with open(p, "w") as f:
+                json.dump({"projects": {}, "padding": "x" * 50}, f)  # new size: re-read
+            self.assertFalse(t.trusted("/w/ok"))
+            self.assertEqual(len(parses), 2)
+        finally:
+            json.load = real_load
+
 
 class FilesTest(unittest.TestCase):
     def setUp(self):
@@ -147,6 +172,53 @@ class TmuxTest(unittest.TestCase):
         self.tmux.capture("Ava", 20, ansi=True)
         self.assertEqual(self.calls[-1], ["tmux", "capture-pane", "-p", "-e", "-t", "=Ava:", "-S", "-20"])
 
+    def test_send_keys_does_not_press_enter_when_the_text_failed(self):
+        self.rc["send-keys"] = 1
+        with self.assertRaises(RuntimeError):
+            self.tmux.send_keys("Ava", "/exit")
+        self.assertEqual(self.calls, [["tmux", "send-keys", "-t", "=Ava:", "-l", "/exit"]])
+
+    def test_has_session_treats_a_timeout_as_present(self):
+        self.rc["has-session"] = 124
+        self.assertTrue(self.tmux.has_session("Ava"))  # never restart a session we could not see
+
+    def test_list_sessions_names_none_on_timeout_empty_without_server(self):
+        def run(argv):
+            return self.rc.get(argv[1], 0), "Ava\nAva-2\n"
+        tmux = TmuxMultiplexer(run=run)
+        self.assertEqual(tmux.list_sessions(), {"Ava", "Ava-2"})
+        self.rc["list-sessions"] = 1
+        self.assertEqual(tmux.list_sessions(), set())
+        self.rc["list-sessions"] = 124
+        self.assertIsNone(tmux.list_sessions())
+
+    def test_pane_info_parses_the_format(self):
+        tmux = TmuxMultiplexer(run=lambda argv: (0, "9925|1|0|1|1\n"))
+        self.assertEqual(tmux.pane_info("Ava"), PaneInfo(9925, True, False, 1, 1))
+        self.assertIsNone(TmuxMultiplexer(run=lambda argv: (0, "garbage\n")).pane_info("Ava"))
+        self.assertIsNone(TmuxMultiplexer(run=lambda argv: (1, "")).pane_info("Ava"))
+
+    def test_kill_session_targets_the_exact_name(self):
+        self.assertTrue(self.tmux.kill_session("Ava"))
+        self.assertEqual(self.calls[-1], ["tmux", "kill-session", "-t", "=Ava"])
+
+    def test_timeouts_are_reported_through_on_error(self):
+        seen = []
+        tmux = TmuxMultiplexer(run=lambda argv: (124, "timed out after 10s: tmux send-keys"), on_error=seen.append)
+        tmux.capture("Ava", 5)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("capture-pane", seen[0])
+
+
+class RunTest(unittest.TestCase):
+    def test_a_timed_out_command_returns_124_not_raises(self):
+        rc, out = run_command(["sleep", "5"], timeout=0.2)
+        self.assertEqual(rc, 124)
+        self.assertIn("timed out", out)
+
+    def test_a_missing_program_returns_127(self):
+        self.assertEqual(run_command(["/nonexistent/claude-rc-test"])[0], 127)
+
 
 @unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
 class RealTmuxTest(unittest.TestCase):
@@ -170,6 +242,18 @@ class RealTmuxTest(unittest.TestCase):
                 break
             time.sleep(0.1)
         self.assertIn("/remote-control", self.tmux.capture("rc-probe", 20))
+
+    def test_list_sessions_pane_info_copy_mode_and_kill(self):
+        d = tempfile.mkdtemp()
+        self.tmux.new_session("rc-probe", d, ("cat",))
+        self.assertIn("rc-probe", self.tmux.list_sessions())
+        info = self.tmux.pane_info("rc-probe")
+        self.assertEqual((info.in_mode, info.windows, info.panes), (False, 1, 1))
+        os.system(f"tmux -L {self.sock} copy-mode -t =rc-probe: >/dev/null 2>&1")
+        self.assertTrue(self.tmux.pane_info("rc-probe").in_mode)
+        self.assertTrue(self.tmux.kill_session("rc-probe"))
+        self.assertFalse(self.tmux.has_session("rc-probe"))
+        self.assertIsNone(self.tmux.pane_info("rc-probe"))
 
     def test_a_taken_name_raises(self):
         d = tempfile.mkdtemp()

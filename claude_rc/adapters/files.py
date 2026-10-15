@@ -63,6 +63,7 @@ class JsonStateStore:
                 last_state=State(h["last_state"]) if h.get("last_state") else None,
                 idle_unlinked_runs=int(h.get("idle_unlinked_runs", 0)),
                 relinked_at=h.get("relinked_at"),
+                note=h.get("note"),
             )
             for name, h in data.get("histories", {}).items()
         }
@@ -73,7 +74,7 @@ class JsonStateStore:
             "conditions": conditions,
             "histories": {
                 name: {"restarts": list(h.restarts), "last_state": h.last_state.value if h.last_state else None,
-                       "idle_unlinked_runs": h.idle_unlinked_runs, "relinked_at": h.relinked_at}
+                       "idle_unlinked_runs": h.idle_unlinked_runs, "relinked_at": h.relinked_at, "note": h.note}
                 for name, h in histories.items()
             },
             "queued": queued,

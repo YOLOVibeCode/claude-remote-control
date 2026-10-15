@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from claude_rc.adapters.files import JsonManifestStore, JsonStateStore  # noqa: E402
 from claude_rc.cli import App, flags_to_record  # noqa: E402
-from claude_rc.core import Entry, Record  # noqa: E402
+from claude_rc.core import Entry, PaneInfo, Record  # noqa: E402
 from claude_rc.ports import DeliveryError  # noqa: E402
 
 CONV = "11111111-1111-1111-1111-111111111111"
@@ -30,9 +30,24 @@ class FakeRegistry:
 class FakeMux:
     def __init__(self, registry, comes_up=True):
         self.sessions, self.calls, self.registry, self.comes_up = set(), [], registry, comes_up
+        self.copy_mode, self.keys_fail, self.hung = set(), False, False
 
     def has_session(self, name):
         return name in self.sessions
+
+    def list_sessions(self):
+        return None if self.hung else set(self.sessions)
+
+    def pane_info(self, name):
+        if name not in self.sessions:
+            return None
+        pid = next((r.pid for r in self.registry.records if r.tmux_session == name and r.alive), 1)
+        return PaneInfo(pid, name in self.copy_mode, False, 1, 1)
+
+    def kill_session(self, name):
+        self.calls.append(("kill", name))
+        self.sessions.discard(name)
+        return True
 
     def new_session(self, name, directory, argv):
         self.calls.append(("new", name, directory, tuple(argv)))
@@ -42,6 +57,8 @@ class FakeMux:
             self.registry.records.append(Record(99, conv, directory, name, "idle", True, "2.1.291", True))
 
     def send_keys(self, name, text):
+        if self.keys_fail:
+            raise RuntimeError("tmux send-keys app failed: timed out")
         self.calls.append(("keys", name, text))
 
     pane = "\x1b[39m❯\xa0\n"
@@ -112,6 +129,13 @@ class AppTest(unittest.TestCase):
                     heartbeat=lambda: self.beats, hostname="mac")
         base.update(kw)
         return App(**base)
+
+    def log(self):
+        try:
+            with open(os.path.join(self.home, "watch.log")) as f:
+                return f.read()
+        except FileNotFoundError:
+            return ""
 
     def pin_app(self):
         self.manifest.save([Entry("app", "/w/app", CONV, ("--dangerously-skip-permissions",))])
@@ -199,6 +223,50 @@ class AppTest(unittest.TestCase):
         self.mux.pane = "\x1b[39m❯\xa0\n"
         self.app().watch()
         self.assertEqual([c for c in self.mux.calls if c[0] == "keys"], [("keys", "app", "/remote-control")])
+
+    def test_relink_skip_is_logged_once_per_streak(self):
+        self.pin_app()
+        self.mux.sessions.add("app")
+        self.mux.pane = "\x1b[39m❯\xa0half-written thought\n"
+        self.reg.records = [Record(1, CONV, "/w/app", "app", "idle", False, "2.1.291", True)]
+        for _ in range(5):
+            self.app().watch()
+            self.clock.t += 600
+        self.assertEqual(self.log().count("relink skipped for app: text in its input box"), 1)
+
+    def test_relink_never_types_into_copy_mode(self):
+        self.pin_app()
+        self.mux.sessions.add("app")
+        self.mux.copy_mode.add("app")
+        self.reg.records = [Record(1, CONV, "/w/app", "app", "idle", False, "2.1.291", True)]
+        for _ in range(3):
+            self.app().watch()
+            self.clock.t += 600
+        self.assertEqual([c for c in self.mux.calls if c[0] == "keys"], [])
+        self.assertIn("relink skipped for app: pane in copy mode", self.log())
+
+    def test_a_send_keys_failure_during_relink_is_logged_and_the_run_completes(self):
+        self.pin_app()
+        self.mux.sessions.add("app")
+        self.mux.keys_fail = True
+        self.reg.records = [Record(1, CONV, "/w/app", "app", "idle", False, "2.1.291", True)]
+        for _ in range(2):
+            self.assertEqual(self.app().watch(), 0)
+            self.clock.t += 600
+        self.assertIn("relink app failed", self.log())
+        self.assertEqual(len(self.beats.sent), 2)  # both runs finished and beat
+
+    def test_a_crashing_watch_run_is_logged_not_silent(self):
+        self.pin_app()
+
+        class Broken:
+            def live_sessions(self):
+                raise KeyError("registry went away")
+
+        import contextlib
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.app(registry=Broken()).watch(), 1)
+        self.assertIn("watch crashed: KeyError", self.log())
 
     def test_failed_delivery_is_queued_and_sent_next_run(self):
         self.pin_app()

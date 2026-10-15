@@ -5,7 +5,7 @@ pass the results in. That keeps every rule testable in isolation.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -56,6 +56,17 @@ class History:
     last_state: Optional[State] = None
     idle_unlinked_runs: int = 0
     relinked_at: Optional[float] = None
+    note: Optional[str] = None  # the last "skipped" reason logged, so a blocked action is logged once per streak
+
+
+@dataclass(frozen=True)
+class PaneInfo:
+    """What tmux says about a session's only pane."""
+    pid: int          # the pane's own process (claude itself for a supervised host)
+    in_mode: bool     # copy mode: typed keys would go to tmux, not to claude
+    dead: bool
+    windows: int
+    panes: int
 
 
 def classify(entry: Entry, has_session: bool, record: Optional[Record], history: History, now: float) -> State:
@@ -150,7 +161,8 @@ def plan(observations: List[Observation], histories: Dict[str, History], now: fl
             idle_runs, relinked_at = 0, None
 
         conditions[name] = condition
-        out[name] = History(restarts=recent, last_state=last, idle_unlinked_runs=idle_runs, relinked_at=relinked_at)
+        out[name] = replace(h, restarts=recent, last_state=last, idle_unlinked_runs=idle_runs, relinked_at=relinked_at,
+                            note=h.note if any(getattr(a, "name", None) == name for a in actions) else None)
     return Decision(tuple(actions), conditions, out)
 
 

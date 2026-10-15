@@ -23,6 +23,8 @@ import shutil
 import socket
 import sys
 import time
+import traceback
+from dataclasses import replace
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, TextIO, Tuple
 
 from .core import (
@@ -203,7 +205,22 @@ class App:
         with self.locked() as got:
             if not got:
                 return 0
-            return self._watch()
+            try:
+                return self._watch()
+            except Exception as e:  # a crashed run saves nothing and beats nothing: say so
+                self.log(f"watch crashed: {type(e).__name__}: {e}")
+                traceback.print_exc(file=sys.stderr)
+                return 1
+
+    def _relink_blocker(self, name: str) -> Optional[str]:
+        """Why typing /remote-control into this pane is not safe right now, or None."""
+        pane_info = getattr(self.mux, "pane_info", None)
+        pane = pane_info(name) if pane_info else None
+        if pane is not None and pane.in_mode:
+            return "pane in copy mode"          # keys would go to tmux's copy mode, not to claude
+        if not input_is_empty(self.mux.capture(name, 40, ansi=True)):
+            return "text in its input box"      # Enter would submit the user's draft
+        return None
 
     def _watch(self) -> int:
         # launchd reopens launchd.log at every run, so rolling it between runs is safe.
@@ -225,14 +242,20 @@ class App:
                     conditions[a.name] = "RESTART_FAILED"
                     self.log(f"restart {a.name} failed: {e}")
             elif isinstance(a, Relink):
-                # Never type over a draft or into a menu: Enter would submit the user's text.
-                if input_is_empty(self.mux.capture(a.name, 40, ansi=True)):
-                    self.mux.send_keys(a.name, "/remote-control")
-                    self.log(f"relink: typed /remote-control into {a.name}")
-                else:
-                    h = histories[a.name]
-                    histories[a.name] = History(h.restarts, h.last_state, h.idle_unlinked_runs, None)
-                    self.log(f"relink skipped for {a.name}: text in its input box")
+                h = histories[a.name]
+                blocker = self._relink_blocker(a.name)
+                if blocker is None:
+                    try:
+                        self.mux.send_keys(a.name, "/remote-control")
+                        self.log(f"relink: typed /remote-control into {a.name}")
+                    except RuntimeError as e:
+                        blocker = "tmux send-keys failed"
+                        self.log(f"relink {a.name} failed: {e}")
+                if blocker is not None:
+                    # Try again next run; log the reason once per streak, not every 10 minutes.
+                    histories[a.name] = replace(h, relinked_at=None, note=blocker)
+                    if h.note != blocker:
+                        self.log(f"relink skipped for {a.name}: {blocker}")
 
         if restarted:
             self._await_restarts(restarted, entries, conditions, histories)
@@ -404,12 +427,15 @@ def build_app(home: Optional[str] = None) -> App:
             return time.time()
 
     registry_dir = os.environ.get("CLAUDE_RC_REGISTRY") or os.path.expanduser("~/.claude/sessions")
-    return App(home=home, registry=FileSessionRegistry(registry_dir), mux=TmuxMultiplexer(),
+    mux = TmuxMultiplexer()
+    app = App(home=home, registry=FileSessionRegistry(registry_dir), mux=mux,
                manifest=JsonManifestStore(os.path.join(home, "sessions.json")),
                state=JsonStateStore(os.path.join(home, "state.json")), clock=_Clock(), claude_bin=_claude_bin(),
                text=channel("alerts", build_text_sender), mail=channel("report", build_email_sender),
                trust=ClaudeJsonTrust(), heartbeat=heartbeat_channel,
                hostname=socket.gethostname().split(".")[0])
+    mux.on_error = app.log  # a hung or missing tmux is logged, never fatal
+    return app
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
