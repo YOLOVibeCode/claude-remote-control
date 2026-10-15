@@ -1,3 +1,5 @@
 spec.txt
 .DS_Store
 *.ansi
+__pycache__/
+*.pyc

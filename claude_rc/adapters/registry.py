@@ -4,7 +4,7 @@ from __future__ import annotations
 import glob
 import json
 import os
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 from ..core import Record
 
@@ -17,6 +17,14 @@ def pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _seconds(ms: object) -> Optional[float]:
+    """Claude Code writes timestamps in milliseconds."""
+    try:
+        return float(ms) / 1000 if ms is not None and not isinstance(ms, bool) else None
+    except (TypeError, ValueError):
+        return None
 
 
 class FileSessionRegistry:
@@ -43,5 +51,7 @@ class FileSessionRegistry:
                 linked=bool(d.get("bridgeSessionId")),
                 version=str(d.get("version") or ""),
                 alive=self._alive(pid),
+                status_since=_seconds(d.get("statusUpdatedAt")),
+                waiting_for=str(d.get("waitingFor") or ""),
             ))
         return out

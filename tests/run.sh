@@ -192,6 +192,7 @@ R="$H/Library/LaunchAgents/com.noctusoft.claude-rc.report.plist"
 [ -f "$R" ] && ok "--supervise writes the report agent" || bad "--supervise writes the report agent"
 grep -q '<integer>600</integer>' "$W" 2>/dev/null && ok "watch runs every 10 minutes" || bad "watch runs every 10 minutes"
 grep -q '<key>RunAtLoad</key>' "$W" 2>/dev/null && ok "watch runs at login (after a reboot)" || bad "watch runs at login (after a reboot)"
+grep -q '<key>ProcessType</key><string>Interactive</string>' "$W" 2>/dev/null && ok "sessions never inherit background priority from the watch" || bad "sessions never inherit background priority from the watch"
 grep -q "$H/.local/bin/claude-rc" "$W" 2>/dev/null && ok "watch calls the installed claude-rc" || bad "watch calls the installed claude-rc"
 grep -q '__' "$W" "$R" 2>/dev/null && bad "no template placeholders left" || ok "no template placeholders left"
 plutil -lint "$W" "$R" >/dev/null 2>&1 && ok "plists are valid" || { command -v plutil >/dev/null || ok "plists are valid (plutil n/a)"; command -v plutil >/dev/null && bad "plists are valid"; }
@@ -210,6 +211,10 @@ n=$(grep -c 'claude-tmux.sh" ] && \.' "$H/.zshrc")
 printf 'alias cc="claude --model opus"\n' > "$H/.zshrc"
 inst
 [ "$(grep -c '^alias cc=' "$H/.zshrc")" = 1 ] && ok "an existing cc alias is left alone" || bad "an existing cc alias is left alone"
+
+if [ -d "$root/.git" ] && command -v git >/dev/null; then
+  git -C "$root" ls-files | grep -q __pycache__ && bad "no compiled bytecode is tracked" || ok "no compiled bytecode is tracked"
+fi
 
 echo "claude-rc (python unittest)"
 py=/usr/bin/python3; [ -x "$py" ] || py=python3   # launchd runs the system python; test with it

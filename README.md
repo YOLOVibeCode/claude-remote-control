@@ -88,7 +88,7 @@ New sessions are pinned at birth: the `claude()` wrapper passes `--session-id <u
 it. Each manifest line holds `name`, `dir`, `conversation`, `flags` (reused on restart; seeded as
 `--dangerously-skip-permissions`) and `enabled` (set `false` to leave a session alone).
 
-**States.** `OK` alive on its conversation and linked. `DEAD` no tmux session: restarted (3 an
+**States.** `PARKED` stopped on purpose (see below): never restarted. `OK` alive on its conversation and linked. `DEAD` no tmux session: restarted (3 an
 hour at most, then `GAVE_UP`). `UNLINKED` Remote Control dropped: when the session is idle for
 two runs, `/remote-control` is typed into it once (`UNLINKED_STUCK` if that did not work).
 `WRONG_CONVERSATION` and `NOT_RUNNING` are reported and never touched. `UNTRUSTED`: a dead
@@ -132,6 +132,52 @@ stops the watchdog.
 **Reboots.** launchd user agents start at login. With FileVault on, a reboot waits for someone to
 log in; for unattended reboots, turn on automatic login (System Settings → Users & Groups) only if
 that trade-off is acceptable for this Mac.
+
+## Day, night and the door: stay reachable without hogging the Mac
+
+By default the watchdog keeps every pinned session running forever. Each idle Claude Code
+session holds 250-600 MB and wakes the CPU about ten times a second, so thirty of them
+cost gigabytes for chats nobody is using. A `policy` and a `door` in `config.json` change
+that. Both are off until you turn them on, and `claude-rc plan` shows what they would do
+first.
+
+| | Day (06:00-24:00) | Night (00:00-06:00) |
+| --- | --- | --- |
+| A session idle this long is **parked** | 8 hours | 30 minutes |
+| Most sessions running | 8 (least recently used parked first; never one used in the last hour) | same |
+| Still running | busy or waiting sessions, `keep` sessions, recent work | the door, `keep` sessions, anything used in the last 30 minutes, all at background priority |
+| After a crash | restarted if it was in use | restarted only if it was in use in the last 30 minutes |
+
+**Parked** means stopped on purpose, losing nothing: `/exit` is typed only when the session is
+idle, its input box is empty, the pane is not in copy mode, and claude is the pane's own
+process. If `/exit` does not end it within 30 seconds and it is still idle, its tmux session is
+closed. A parked session is never restarted and never alerts. `claude-rc unpark NAME` brings
+back the same conversation.
+
+**The door** is one always-on `claude remote-control` server (the same thing `ccserve` runs),
+supervised by the watchdog. From the Claude app you can always start a session on this Mac, or
+ask the door to run `claude-rc unpark NAME`. It runs with `--permission-mode acceptEdits`, so
+edits go through but commands ask on your phone. At night it drops to background priority.
+
+| Command | Effect |
+| --- | --- |
+| `claude-rc plan [--at HOUR] [--json]` | What a watch run would do with the policy on, and why a park would be blocked. Changes nothing |
+| `claude-rc park NAME...` | Stop a session on purpose; it stays parked |
+| `claude-rc unpark NAME...` / `--all` | Start parked sessions again on the same conversation |
+| `claude-rc keep NAME...` / `auto NAME...` | `keep`: always running, never parked. `auto` (default): parked when idle |
+
+**Turning it on.** Run `claude-rc plan` and `claude-rc plan --at 1`, then `claude-rc keep` the
+sessions that must always run (a dev server, for example). Clear anything listed as blocked
+(press `q` in a pane in copy mode; send or delete a draft). Then set `"policy": {"enabled":
+true}` and `"door": {"enabled": true}` in `config.json` (see
+[`config.example.json`](config.example.json) for every setting). A first week with
+`"idle_park_hours": 72` and `"max_live": 30` is a gentle start. To undo, set `enabled` back to
+`false`: the next run restores normal priority, and `claude-rc unpark --all` brings everything
+back.
+
+**When delivery fails.** If alerts, the heartbeat or the report fail 3 runs in a row, the
+watchdog shows a macOS notification once, lists the channel in the daily report and in
+`claude-rc check`, and logs when it recovers.
 
 ## Safety
 

@@ -122,6 +122,10 @@ if [ -n "$supervise" ]; then
   "$HOME/.local/bin/claude-rc" adopt || true
   echo "manifest: ~/.config/claude-rc/sessions.json (edit flags / enabled per session)"
   echo "alerts:   ~/.config/claude-rc/config.json + secrets.env (see README, Supervision)"
+  echo "policy:   off until you turn it on. Preview first, nothing changes:"
+  echo "            claude-rc plan          # day profile"
+  echo "            claude-rc plan --at 1   # night profile"
+  echo "          then set \"policy\": {\"enabled\": true} and \"door\": {\"enabled\": true} in config.json"
 fi
 
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then

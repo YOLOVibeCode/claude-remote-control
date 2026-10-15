@@ -22,6 +22,28 @@
       "url": "https://<your-always-on-service>/v1/heartbeat"
     }
   },
+  "policy": {
+    "_comment": "Off until enabled. Preview with: claude-rc plan, claude-rc plan --at 1",
+    "enabled": false,
+    "night_start_hour": 0,
+    "night_end_hour": 6,
+    "idle_park_hours": 8,
+    "night_idle_minutes": 30,
+    "max_live": 8,
+    "budget_min_idle_minutes": 60,
+    "throttle_at_night": true,
+    "morning_revive": false
+  },
+  "door": {
+    "_comment": "One always-on 'claude remote-control' server in tmux session 'remote'",
+    "enabled": false,
+    "session": "remote",
+    "name": "",
+    "dir": "~/Dev",
+    "spawn": "same-dir",
+    "capacity": 2,
+    "permission_mode": "acceptEdits"
+  },
   "_other_providers": {
     "twilio (alerts)": {
       "provider": "twilio",
