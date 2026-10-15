@@ -3,6 +3,7 @@
     claude-rc adopt [--quiet]          record live tmux hosts in the manifest (never overwrites)
     claude-rc pin NAME DIR UUID -- ARGS   record a new session (called by the claude() wrapper)
     claude-rc has NAME                 exit 0 if NAME is pinned
+    claude-rc keep|auto NAME...        keep: always running, never parked; auto: parked when idle
     claude-rc up [NAME...]             start pinned hosts that have no tmux session
     claude-rc check [--json]           state of every pinned host; exit 1 if any needs attention
     claude-rc watch                    check, restart/relink what is safe, alert on changes
@@ -176,6 +177,20 @@ class App:
         self.log(f"pin: {name} {conversation[:8]}")
         return 0
 
+    def set_tier(self, names: Sequence[str], tier: str) -> int:
+        """`claude-rc keep NAME` (always running, never parked) or `claude-rc auto NAME`."""
+        entries = self.manifest.load()
+        known = {e.name for e in entries}
+        unknown = [n for n in names if n not in known]
+        if unknown:
+            print(f"not pinned: {', '.join(unknown)}", file=self.out)
+            return 2
+        self.manifest.save([replace(e, tier=tier) if e.name in names else e for e in entries])
+        for n in names:
+            print(f"{n}: {tier}", file=self.out)
+            self.log(f"tier: {n} -> {tier}")
+        return 0
+
     def has(self, name: str) -> int:
         return 0 if any(e.name == name for e in self.manifest.load()) else 1
 
@@ -188,7 +203,8 @@ class App:
             argv = [self.claude_bin, "--remote-control", e.name, "--resume", e.conversation, *e.flags]
             self.mux.new_session(e.name, e.dir, argv)
             h = histories.get(e.name, History())
-            histories[e.name] = History(h.restarts + (now,), State.STARTING, 0, None)
+            histories[e.name] = replace(h, restarts=h.restarts + (now,), last_state=State.STARTING,
+                                        idle_unlinked_runs=0, relinked_at=None)
             print(f"started {e.name} on {e.conversation[:8]}", file=self.out)
             self.log(f"up: started {e.name}")
         self.state.save(conditions, histories, queued)
@@ -342,8 +358,7 @@ class App:
             self.sleep(POLL_S)
         for n in pending:
             conditions[n] = "RESTART_FAILED"
-            h = histories[n]
-            histories[n] = History(h.restarts, State.RESTART_FAILED, h.idle_unlinked_runs, h.relinked_at)
+            histories[n] = replace(histories[n], last_state=State.RESTART_FAILED)
             pane = self.mux.capture(n, 20).strip().splitlines()[-8:]
             self.log(f"restart {n} did not register on {want[n][:8]}; pane: " + " | ".join(pane))
 
@@ -495,6 +510,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pn = sub.add_parser("pin"); pn.add_argument("name"); pn.add_argument("dir"); pn.add_argument("conversation")  # noqa: E702
     pn.add_argument("args", nargs=argparse.REMAINDER)
     h = sub.add_parser("has"); h.add_argument("name")  # noqa: E702
+    k = sub.add_parser("keep"); k.add_argument("names", nargs="+")  # noqa: E702
+    au = sub.add_parser("auto"); au.add_argument("names", nargs="+")  # noqa: E702
     u = sub.add_parser("up"); u.add_argument("names", nargs="*")  # noqa: E702
     c = sub.add_parser("check"); c.add_argument("--json", action="store_true")  # noqa: E702
     sub.add_parser("watch")
@@ -510,6 +527,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return app.pin(ns.name, ns.dir, ns.conversation, rest)
     if ns.cmd == "has":
         return app.has(ns.name)
+    if ns.cmd in ("keep", "auto"):
+        return app.set_tier(ns.names, ns.cmd)
     if ns.cmd == "up":
         return app.up(ns.names)
     if ns.cmd == "check":

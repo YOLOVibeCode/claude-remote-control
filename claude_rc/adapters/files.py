@@ -6,7 +6,7 @@ import os
 import tempfile
 from typing import Dict, List, Tuple
 
-from ..core import ChannelHealth, Entry, History, State
+from ..core import TIERS, ChannelHealth, Entry, History, State
 
 
 def write_private(path: str, data: object) -> None:
@@ -40,13 +40,15 @@ class JsonManifestStore:
         data = read_json(self.path, {"sessions": []})
         return [
             Entry(name=s["name"], dir=s["dir"], conversation=s["conversation"],
-                  flags=tuple(s.get("flags", ())), enabled=bool(s.get("enabled", True)))
+                  flags=tuple(s.get("flags", ())), enabled=bool(s.get("enabled", True)),
+                  tier=s.get("tier") if s.get("tier") in TIERS else "auto")
             for s in data.get("sessions", [])
         ]
 
     def save(self, entries: List[Entry]) -> None:
         write_private(self.path, {"sessions": [
-            {"name": e.name, "dir": e.dir, "conversation": e.conversation, "flags": list(e.flags), "enabled": e.enabled}
+            {"name": e.name, "dir": e.dir, "conversation": e.conversation, "flags": list(e.flags), "enabled": e.enabled,
+             "tier": e.tier}
             for e in entries
         ]})
 
@@ -64,6 +66,10 @@ class JsonStateStore:
                 idle_unlinked_runs=int(h.get("idle_unlinked_runs", 0)),
                 relinked_at=h.get("relinked_at"),
                 note=h.get("note"),
+                parked_at=h.get("parked_at"),
+                parked_reason=h.get("parked_reason"),
+                last_active=h.get("last_active"),
+                throttled_pid=h.get("throttled_pid"),
             )
             for name, h in data.get("histories", {}).items()
         }
@@ -74,7 +80,9 @@ class JsonStateStore:
             "conditions": conditions,
             "histories": {
                 name: {"restarts": list(h.restarts), "last_state": h.last_state.value if h.last_state else None,
-                       "idle_unlinked_runs": h.idle_unlinked_runs, "relinked_at": h.relinked_at, "note": h.note}
+                       "idle_unlinked_runs": h.idle_unlinked_runs, "relinked_at": h.relinked_at, "note": h.note,
+                       "parked_at": h.parked_at, "parked_reason": h.parked_reason, "last_active": h.last_active,
+                       "throttled_pid": h.throttled_pid}
                 for name, h in histories.items()
             },
             "queued": queued,

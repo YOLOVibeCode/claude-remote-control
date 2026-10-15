@@ -34,6 +34,10 @@ class Entry:
     conversation: str
     flags: Tuple[str, ...] = ()
     enabled: bool = True
+    tier: str = "auto"   # "keep": always running, never parked; "auto": parked when idle (policy)
+
+
+TIERS = ("auto", "keep")
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,8 @@ class Record:
     linked: bool         # bridgeSessionId present
     version: str
     alive: bool
+    status_since: Optional[float] = None  # statusUpdatedAt in seconds: idle since, when status is idle
+    waiting_for: str = ""                 # why a "waiting" session waits (input needed, dialog open, ...)
 
 
 @dataclass(frozen=True)
@@ -57,6 +63,10 @@ class History:
     idle_unlinked_runs: int = 0
     relinked_at: Optional[float] = None
     note: Optional[str] = None  # the last "skipped" reason logged, so a blocked action is logged once per streak
+    parked_at: Optional[float] = None       # stopped on purpose; never restarted while set
+    parked_reason: Optional[str] = None     # idle | night | budget | manual
+    last_active: Optional[float] = None     # last time the user did something there; survives the process
+    throttled_pid: Optional[int] = None     # the pid `taskpolicy -b` was applied to
 
 
 @dataclass(frozen=True)

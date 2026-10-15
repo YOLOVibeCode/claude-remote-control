@@ -66,6 +66,15 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(got[0], Record(10, CONV, "/w/app", "app", "idle", True, "2.1.291", True))
         self.assertEqual(got[1], Record(11, OTHER, "/w/app", None, "busy", False, "2.1.291", False))
 
+    def test_reads_status_since_in_seconds_and_waiting_for(self):
+        self.write(10, statusUpdatedAt=1792062167406, waitingFor="input needed", status="waiting")
+        self.write(11, statusUpdatedAt="not a number")
+        reg = FileSessionRegistry(self.dir, pid_alive=lambda pid: True)
+        got = {r.pid: r for r in reg.live_sessions()}
+        self.assertAlmostEqual(got[10].status_since, 1792062167.406)
+        self.assertEqual(got[10].waiting_for, "input needed")
+        self.assertIsNone(got[11].status_since)
+
     def test_skips_unreadable_files_and_key_files(self):
         self.write(10)
         open(os.path.join(self.dir, "12.json"), "w").write("{not json")
@@ -116,6 +125,26 @@ class TrustTest(unittest.TestCase):
 class FilesTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
+
+    def test_manifest_reads_old_entries_as_auto_and_round_trips_tier(self):
+        path = os.path.join(self.dir, "sessions.json")
+        with open(path, "w") as f:
+            json.dump({"sessions": [{"name": "a", "dir": "/w/a", "conversation": CONV, "flags": [], "enabled": True},
+                                    {"name": "b", "dir": "/w/b", "conversation": CONV, "tier": "bogus"}]}, f)
+        store = JsonManifestStore(path)
+        self.assertEqual([e.tier for e in store.load()], ["auto", "auto"])
+        store.save([Entry("a", "/w/a", CONV, tier="keep")])
+        self.assertEqual(store.load()[0].tier, "keep")
+
+    def test_state_round_trips_the_parking_fields_and_reads_old_files(self):
+        store = JsonStateStore(os.path.join(self.dir, "state.json"))
+        h = {"a": History(restarts=(1.0,), last_state=State.OK, note="copy mode", parked_at=5.0, parked_reason="night",
+                          last_active=4.0, throttled_pid=99)}
+        store.save({"a": "PARKED"}, h, [])
+        self.assertEqual(store.load()[1], h)
+        with open(store.path, "w") as f:
+            json.dump({"conditions": {"a": "OK"}, "histories": {"a": {"restarts": [1.0], "last_state": "OK"}}}, f)
+        self.assertEqual(store.load()[1]["a"], History(restarts=(1.0,), last_state=State.OK))
 
     def test_manifest_round_trips_and_is_private(self):
         store = JsonManifestStore(os.path.join(self.dir, "sessions.json"))

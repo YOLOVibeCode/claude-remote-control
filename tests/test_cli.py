@@ -167,6 +167,14 @@ class AppTest(unittest.TestCase):
         self.assertEqual(a.has("app"), 0)
         self.assertEqual(a.has("nope"), 1)
 
+    def test_keep_and_auto_set_the_tier_and_an_unknown_name_exits_2(self):
+        self.pin_app()
+        self.assertEqual(self.app().set_tier(["app"], "keep"), 0)
+        self.assertEqual(self.manifest.load()[0].tier, "keep")
+        self.assertEqual(self.app().set_tier(["app"], "auto"), 0)
+        self.assertEqual(self.manifest.load()[0].tier, "auto")
+        self.assertEqual(self.app().set_tier(["nope"], "keep"), 2)
+
     # watch ----------------------------------------------------------------------------------
     def test_watch_restarts_a_dead_host_and_logs_restart_then_return_without_texting(self):
         self.pin_app()
