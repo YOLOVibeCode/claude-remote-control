@@ -115,6 +115,89 @@ def restart_argv(entry: Entry, claude_bin: str) -> List[str]:
     return [claude_bin, "--remote-control", entry.name, "--resume", entry.conversation, *entry.flags]
 
 
+# --- when to keep hosts running ---------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Policy:
+    """How greedy the watchdog may be with this machine. Off unless config.json says otherwise."""
+    enabled: bool = False
+    night_start_hour: int = 0          # night = [start, end) in local hours; wraps past midnight if start > end
+    night_end_hour: int = 6
+    idle_park_hours: float = 8.0       # day: park a host idle this long
+    max_live: int = 8                  # day and night: most hosts with a live claude (the door does not count)
+    budget_min_idle_minutes: int = 60  # the budget never parks a host idle less than this
+    night_idle_minutes: int = 30       # night: park a host idle this long
+    throttle_at_night: bool = True     # night: hosts still running drop to background priority
+    morning_revive: bool = False       # day: restart hosts parked for "night" (keep-tier always runs)
+
+
+_BAD = object()
+
+
+def _typed(value: object, kind: type) -> object:
+    if kind is bool:
+        return value if isinstance(value, bool) else _BAD
+    if isinstance(value, bool):  # True is an int in Python; never accept it as a number
+        return _BAD
+    if kind is int:
+        return value if isinstance(value, int) else _BAD
+    if kind is float:
+        return float(value) if isinstance(value, (int, float)) else _BAD
+    if kind is str:
+        return value if isinstance(value, str) else _BAD
+    return _BAD
+
+
+def _parse_section(raw: object, default: object, rules: Dict[str, Tuple[type, object]], label: str) -> Tuple[object, List[str]]:
+    """Each bad value falls back to its own default with one warning; keys starting with _ are comments."""
+    if raw is None:
+        return default, []
+    if not isinstance(raw, dict):
+        return default, [f"{label}: expected an object; using defaults"]
+    kw: Dict[str, object] = {}
+    warnings: List[str] = []
+    for key, value in raw.items():
+        if str(key).startswith("_"):
+            continue
+        rule = rules.get(key)
+        if rule is None:
+            warnings.append(f"{label}.{key}: unknown setting, ignored")
+            continue
+        kind, valid = rule
+        v = _typed(value, kind)  # type: ignore[arg-type]
+        if v is _BAD or (valid is not None and not valid(v)):  # type: ignore[operator]
+            warnings.append(f"{label}.{key}: {value!r} is not valid; using {getattr(default, key)!r}")
+            continue
+        kw[key] = v
+    return replace(default, **kw), warnings  # type: ignore[type-var]
+
+
+_POLICY_RULES: Dict[str, Tuple[type, object]] = {
+    "enabled": (bool, None),
+    "night_start_hour": (int, lambda v: 0 <= v <= 23),
+    "night_end_hour": (int, lambda v: 0 <= v <= 23),
+    "idle_park_hours": (float, lambda v: 0 < v <= 720),
+    "max_live": (int, lambda v: v >= 0),
+    "budget_min_idle_minutes": (int, lambda v: v >= 0),
+    "night_idle_minutes": (int, lambda v: v > 0),
+    "throttle_at_night": (bool, None),
+    "morning_revive": (bool, None),
+}
+
+
+def parse_policy(raw: object) -> Tuple[Policy, List[str]]:
+    policy, warnings = _parse_section(raw, Policy(), _POLICY_RULES, "policy")
+    return policy, warnings  # type: ignore[return-value]
+
+
+def is_night(p: Policy, hour: int) -> bool:
+    if p.night_start_hour == p.night_end_hour:
+        return False
+    if p.night_start_hour < p.night_end_hour:
+        return p.night_start_hour <= hour < p.night_end_hour
+    return hour >= p.night_start_hour or hour < p.night_end_hour
+
+
 # --- what a watch run does -------------------------------------------------------------
 
 MAX_RESTARTS_PER_HOUR = 3
@@ -160,34 +243,138 @@ class Stop:
 
 
 @dataclass(frozen=True)
+class Throttle:
+    """Move a running host to background priority (night) or back (day). macOS taskpolicy."""
+    name: str
+    pid: int
+    on: bool
+
+
+ACTIVE = ("busy", "waiting")
+
+
+@dataclass(frozen=True)
 class Decision:
     actions: Tuple[object, ...]
     conditions: Dict[str, str]
     histories: Dict[str, History]
 
 
-def plan(observations: List[Observation], histories: Dict[str, History], now: float, claude_bin: str) -> Decision:
+def _last_active(observations: List[Observation], histories: Dict[str, History], now: float) -> Dict[str, Optional[float]]:
+    """When the user last did something in each host: now if it is working, else when it went idle.
+    Kept in History so a host that is down still ranks by when it was last used."""
+    out: Dict[str, Optional[float]] = {}
+    for o in observations:
+        la = histories.get(o.entry.name, History()).last_active
+        if o.state in (State.OK, State.UNLINKED):
+            if o.status in ACTIVE:
+                la = now
+            elif o.status == "idle" and o.status_since is not None:
+                la = o.status_since if la is None else max(la, o.status_since)
+        out[o.entry.name] = la
+    return out
+
+
+def park_reasons(observations: List[Observation], histories: Dict[str, History], last_active: Dict[str, Optional[float]],
+                 now: float, policy: Policy, night: bool) -> Dict[str, Optional[str]]:
+    """Which hosts should not be running, and why ("idle", "night", "budget"); None means it may run.
+
+    One rule for parking and for restarting, day and night: keep-tier, busy and waiting hosts always
+    run; the rest run if they were used recently (within idle_park_hours by day, night_idle_minutes at
+    night), most recent first, up to max_live; the budget never cuts a host used in the last hour."""
+    out: Dict[str, Optional[str]] = {o.entry.name: None for o in observations}
+    if not policy.enabled:
+        return out
+    limit = policy.night_idle_minutes * 60 if night else policy.idle_park_hours * 3600
+    floor = policy.budget_min_idle_minutes * 60
+    forced = 0
+    ranked: List[Tuple[float, str, bool]] = []
+    for o in observations:
+        name = o.entry.name
+        h = histories.get(name, History())
+        live = o.state in (State.OK, State.UNLINKED)
+        revivable = (o.state is State.PARKED and policy.morning_revive and not night and h.parked_reason == "night")
+        if o.state in (State.STARTING, State.WRONG_CONVERSATION):
+            forced += 1  # a claude is running there: it counts against the budget
+            continue
+        if not (live or o.state is State.DEAD or revivable):
+            continue     # DISABLED, NOT_RUNNING, RESTART_FAILED, PARKED: not this rule's business
+        if o.entry.tier == "keep":
+            if live or o.trusted:
+                forced += 1
+            continue
+        if live and (o.status != "idle" or o.status_since is None):
+            forced += 1  # working, waiting on you, or unknown: never parked
+            continue
+        la = last_active.get(name)
+        age = None if la is None else max(0.0, now - la)
+        if age is None or age >= limit:
+            out[name] = "night" if night else "idle"
+            continue
+        if not live and not o.trusted:
+            continue     # used recently but cannot start: reported UNTRUSTED as before
+        ranked.append((age, name, live))
+    slots = max(0, policy.max_live - forced)
+    for i, (age, name, live) in enumerate(sorted(ranked)):
+        if i < slots or (live and age < floor):
+            continue
+        out[name] = "budget"
+    return out
+
+
+def plan(observations: List[Observation], histories: Dict[str, History], now: float, claude_bin: str,
+         policy: Optional[Policy] = None, night: bool = False) -> Decision:
+    policy = policy or Policy()
     actions: List[object] = []
     conditions: Dict[str, str] = {}
     out: Dict[str, History] = {}
+    last_active = _last_active(observations, histories, now)
+    reasons = park_reasons(observations, histories, last_active, now, policy, night)
+    night_idle_s = policy.night_idle_minutes * 60
     for o in observations:
         name = o.entry.name
         h = histories.get(name, History())
         recent = tuple(t for t in h.restarts if now - t < 3600)
         idle_runs, relinked_at, last = h.idle_unlinked_runs, h.relinked_at, o.state
+        parked_at, parked_reason, throttled = h.parked_at, h.parked_reason, h.throttled_pid
         condition = o.state.value
-
-        parked_at, parked_reason = h.parked_at, h.parked_reason
-        if o.state in (State.OK, State.UNLINKED):
+        why = reasons.get(name)
+        live = o.state in (State.OK, State.UNLINKED)
+        emitted = False
+        if live:
             parked_at, parked_reason = None, None   # running on its conversation again: not parked
+        else:
+            throttled = None                        # no process: nothing is throttled
 
-        if o.state is State.PARKED:
+        if live and why is not None and o.pid is not None:
+            fallback = "UNLINKED_STUCK" if (o.state is State.UNLINKED and relinked_at is not None) else o.state.value
+            actions.append(Stop(name, o.pid, why, o.status_since, o.state, fallback))
+            emitted = True
+            if night and policy.throttle_at_night and throttled != o.pid:
+                actions.append(Throttle(name, o.pid, True))  # if the stop is blocked, it still sleeps lightly
+                throttled = o.pid
+            condition, last = "PARKED", State.PARKED
+            parked_at, parked_reason = now, why
+            idle_runs, relinked_at = 0, None
+        elif o.state is State.PARKED:
             condition = "PARKED"
+            revive = (why is None and policy.enabled and policy.morning_revive and not night
+                      and h.parked_reason == "night" and o.trusted)
+            if revive and len(recent) < MAX_RESTARTS_PER_HOUR:
+                actions.append(Restart(name, o.entry.dir, tuple(restart_argv(o.entry, claude_bin))))
+                emitted = True
+                recent = recent + (now,)
+                condition, last = "RESTARTED", State.STARTING
+                parked_at, parked_reason = None, None
+        elif o.state is State.DEAD and why is not None:
+            condition, last = "PARKED", State.PARKED
+            parked_at, parked_reason = now, why
         elif o.state is State.DEAD and not o.trusted:
             condition = "UNTRUSTED"
         elif o.state is State.DEAD:
             if len(recent) < MAX_RESTARTS_PER_HOUR:
                 actions.append(Restart(name, o.entry.dir, tuple(restart_argv(o.entry, claude_bin))))
+                emitted = True
                 recent = recent + (now,)
                 condition, last = "RESTARTED", State.STARTING
             else:
@@ -198,14 +385,27 @@ def plan(observations: List[Observation], histories: Dict[str, History], now: fl
                 condition = "UNLINKED_STUCK"
             elif idle_runs >= RELINK_AFTER_IDLE_RUNS:
                 actions.append(Relink(name))
+                emitted = True
                 relinked_at = now
         if o.state is not State.UNLINKED:
             idle_runs, relinked_at = 0, None
 
+        if live and why is None and o.pid is not None:
+            want_bg = (policy.enabled and night and policy.throttle_at_night and o.status == "idle"
+                       and o.status_since is not None and now - o.status_since >= night_idle_s)
+            if throttled is not None and throttled != o.pid:
+                throttled = None                    # a new process: the old one's setting went with it
+            if want_bg and throttled is None:
+                actions.append(Throttle(name, o.pid, True))
+                throttled = o.pid
+            elif not want_bg and throttled is not None:
+                actions.append(Throttle(name, o.pid, False))
+                throttled = None
+
         conditions[name] = condition
         out[name] = replace(h, restarts=recent, last_state=last, idle_unlinked_runs=idle_runs, relinked_at=relinked_at,
-                            note=h.note if any(getattr(a, "name", None) == name for a in actions) else None,
-                            parked_at=parked_at, parked_reason=parked_reason)
+                            note=h.note if emitted else None, parked_at=parked_at, parked_reason=parked_reason,
+                            last_active=last_active.get(name), throttled_pid=throttled)
     return Decision(tuple(actions), conditions, out)
 
 

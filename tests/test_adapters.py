@@ -12,6 +12,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from claude_rc.adapters.qos import TaskPolicy  # noqa: E402
 from claude_rc.adapters.files import JsonHealthStore, JsonManifestStore, JsonStateStore  # noqa: E402
 from claude_rc.adapters.registry import FileSessionRegistry  # noqa: E402
 from claude_rc.adapters.run import run_command  # noqa: E402
@@ -171,6 +172,26 @@ class HealthStoreTest(unittest.TestCase):
         store.save(h)
         self.assertEqual(store.load(), h)
         self.assertEqual(stat.S_IMODE(os.stat(store.path).st_mode), 0o600)
+
+
+class TaskPolicyTest(unittest.TestCase):
+    def test_off_unless_enabled(self):
+        calls = []
+        self.assertFalse(TaskPolicy(run=lambda a: (calls.append(a), (0, ""))[1], enabled=False).background(42, True))
+        self.assertEqual(calls, [])
+
+    def test_background_on_and_off(self):
+        calls = []
+        q = TaskPolicy(run=lambda a: (calls.append(a), (0, ""))[1], enabled=True, binary="/usr/sbin/taskpolicy")
+        self.assertTrue(q.background(42, True))
+        self.assertTrue(q.background(42, False))
+        self.assertEqual(calls, [["/usr/sbin/taskpolicy", "-b", "-p", "42"], ["/usr/sbin/taskpolicy", "-B", "-p", "42"]])
+
+    def test_a_failure_returns_false(self):
+        self.assertFalse(TaskPolicy(run=lambda a: (1, "no such process"), enabled=True).background(42, True))
+
+    def test_it_is_on_only_where_taskpolicy_exists(self):
+        self.assertEqual(TaskPolicy().enabled, sys.platform == "darwin" and os.path.exists("/usr/sbin/taskpolicy"))
 
 
 class MacNotificationTest(unittest.TestCase):

@@ -11,12 +11,15 @@ from claude_rc.core import (  # noqa: E402
     ChannelHealth,
     Entry,
     PaneInfo,
+    Policy,
     History,
     Record,
     State,
     classify,
     coalesce_queue,
     input_is_empty,
+    is_night,
+    parse_policy,
     restart_argv,
     stop_blocker,
     track_delivery,
@@ -189,6 +192,42 @@ class StopBlockerTest(unittest.TestCase):
 
     def test_no_pane_blocks(self):
         self.assertEqual(stop_blocker(self.fresh(), None, "", 42, NOW - 3600), "no pane")
+
+
+class PolicyParseTest(unittest.TestCase):
+    def test_a_missing_or_non_object_section_is_off_with_defaults(self):
+        self.assertEqual(parse_policy(None), (Policy(), []))
+        policy, warnings = parse_policy("on")
+        self.assertEqual(policy, Policy())
+        self.assertEqual(len(warnings), 1)
+
+    def test_valid_values_are_taken(self):
+        policy, warnings = parse_policy({"enabled": True, "night_start_hour": 23, "idle_park_hours": 4, "max_live": 3})
+        self.assertEqual(warnings, [])
+        self.assertEqual((policy.enabled, policy.night_start_hour, policy.idle_park_hours, policy.max_live), (True, 23, 4.0, 3))
+
+    def test_each_bad_value_falls_back_with_one_warning(self):
+        policy, warnings = parse_policy({"enabled": "yes", "night_start_hour": 24, "max_live": True,
+                                         "idle_park_hours": "8", "night_idle_minutes": -1})
+        self.assertEqual(policy, Policy())
+        self.assertEqual(len(warnings), 5)
+
+    def test_unknown_keys_warn_and_comments_are_ignored(self):
+        policy, warnings = parse_policy({"enabeld": True, "_comment": "night = 00-06"})
+        self.assertFalse(policy.enabled)
+        self.assertEqual(warnings, ["policy.enabeld: unknown setting, ignored"])
+
+
+class IsNightTest(unittest.TestCase):
+    def test_the_default_window_is_midnight_to_six(self):
+        self.assertEqual([h for h in range(24) if is_night(Policy(), h)], [0, 1, 2, 3, 4, 5])
+
+    def test_the_window_can_wrap_past_midnight(self):
+        p = Policy(night_start_hour=23, night_end_hour=6)
+        self.assertEqual([h for h in range(24) if is_night(p, h)], [0, 1, 2, 3, 4, 5, 23])
+
+    def test_equal_bounds_is_never_night(self):
+        self.assertFalse(any(is_night(Policy(night_start_hour=3, night_end_hour=3), h) for h in range(24)))
 
 
 class DeliveryHealthTest(unittest.TestCase):

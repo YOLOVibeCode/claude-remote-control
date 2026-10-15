@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from claude_rc.adapters.files import JsonManifestStore, JsonStateStore  # noqa: E402
 from claude_rc.cli import App, flags_to_record  # noqa: E402
-from claude_rc.core import Entry, PaneInfo, Record  # noqa: E402
+from claude_rc.core import Entry, PaneInfo, Policy, Record  # noqa: E402
 from claude_rc.ports import DeliveryError  # noqa: E402
 
 CONV = "11111111-1111-1111-1111-111111111111"
@@ -79,6 +79,17 @@ class FakeNotifier:
 
     def notify(self, title, body):
         self.shown.append((title, body))
+        return True
+
+
+class FakeQos:
+    enabled = True
+
+    def __init__(self):
+        self.calls = []
+
+    def background(self, pid, on):
+        self.calls.append((pid, on))
         return True
 
 
@@ -279,6 +290,83 @@ class AppTest(unittest.TestCase):
         self.assertEqual(self.app().park(["app"]), 0)
         self.app().watch()
         self.assertEqual([c for c in self.mux.calls if c[0] == "new"], [])
+
+    # policy ---------------------------------------------------------------------------------
+    def test_policy_off_never_parks_or_throttles(self):
+        self.live_app(since=self.clock.t - 30 * 3600)
+        qos = FakeQos()
+        self.app(qos=qos, local_hour=lambda t: 1).watch()
+        self.assertEqual([c for c in self.mux.calls if c[0] == "keys"], [])
+        self.assertEqual(qos.calls, [])
+
+    def test_a_day_watch_parks_an_idle_host_and_it_stays_parked(self):
+        self.live_app(since=self.clock.t - 9 * 3600)
+        on = Policy(enabled=True)
+        self.app(policy=on, local_hour=lambda t: 10).watch()
+        self.assertEqual([c for c in self.mux.calls if c[0] == "keys"], [("keys", "app", "/exit")])
+        self.assertIn("parked app (idle, idle 9h00m)", self.log())
+        for _ in range(2):
+            self.clock.t += 600
+            self.app(policy=on, local_hour=lambda t: 10).watch()
+        self.assertEqual([c for c in self.mux.calls if c[0] == "new"], [])
+        self.assertEqual(self.text.sent, [])
+
+    def test_night_drops_a_keep_host_to_background_and_morning_restores_it(self):
+        self.live_app(since=self.clock.t - 2 * 3600)
+        self.app().set_tier(["app"], "keep")
+        qos, on = FakeQos(), Policy(enabled=True)
+        self.app(policy=on, qos=qos, local_hour=lambda t: 1).watch()
+        self.clock.t += 600
+        self.app(policy=on, qos=qos, local_hour=lambda t: 1).watch()
+        self.clock.t += 600
+        self.app(policy=on, qos=qos, local_hour=lambda t: 7).watch()
+        self.assertEqual(qos.calls, [(1, True), (1, False)])
+        self.assertIn("background priority: app", self.log())
+        self.assertIn("normal priority: app", self.log())
+
+    def test_an_unresponsive_tmux_skips_the_run_keeps_state_and_still_beats(self):
+        self.pin_app()
+        self.state.save({"app": "OK"}, {}, [])
+        self.mux.hung = True
+        self.assertEqual(self.app(policy=Policy(enabled=True)).watch(), 0)
+        self.assertEqual(self.mux.calls, [])
+        self.assertEqual(self.state.load()[0], {"app": "OK"})
+        self.assertEqual(len(self.beats.sent), 1)
+        self.assertIn("tmux did not answer; run skipped", self.log())
+
+    def test_plan_is_read_only_and_shows_what_would_happen(self):
+        self.live_app(since=self.clock.t - 9 * 3600)
+        self.app().watch()
+        path = os.path.join(self.home, "state.json")
+        with open(path, "rb") as f:
+            before = f.read()
+        calls = list(self.mux.calls)
+        self.assertEqual(self.app(local_hour=lambda t: 10).preview(), 0)
+        out = self.out.getvalue()
+        self.assertIn("policy is OFF in config.json", out)
+        self.assertIn("park:idle", out)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(self.mux.calls, calls)
+
+    def test_plan_at_a_night_hour_uses_the_night_profile(self):
+        self.live_app(since=self.clock.t - 3600)
+        self.app().preview(at_hour=1, as_json=True)
+        data = json.loads(self.out.getvalue())
+        self.assertEqual((data["profile"], data["rows"][0]["would"]), ("night", "park:night"))
+
+    def test_plan_shows_why_a_park_would_be_blocked(self):
+        self.live_app(since=self.clock.t - 9 * 3600)
+        self.mux.copy_mode.add("app")
+        self.app(local_hour=lambda t: 10).preview(as_json=True)
+        self.assertEqual(json.loads(self.out.getvalue())["rows"][0]["blocked"], "copy mode")
+
+    def test_check_shows_the_policy_line_and_config_warnings(self):
+        self.live_app()
+        self.app(policy=Policy(enabled=True), local_hour=lambda t: 10, config_warnings=["policy.x: unknown setting, ignored"]).check()
+        out = self.out.getvalue()
+        self.assertIn("policy: on, day profile", out)
+        self.assertIn("attention: config: policy.x", out)
 
     # watch ----------------------------------------------------------------------------------
     def test_watch_restarts_a_dead_host_and_logs_restart_then_return_without_texting(self):

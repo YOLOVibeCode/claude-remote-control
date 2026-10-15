@@ -8,7 +8,8 @@
     claude-rc park NAME...             stop a host on purpose (/exit); it stays parked
     claude-rc unpark NAME...|--all     bring parked hosts back on the same conversation
     claude-rc check [--json]           state of every pinned host; exit 1 if any needs attention
-    claude-rc watch                    check, restart/relink what is safe, alert on changes
+    claude-rc plan [--at HOUR] [--json] what a watch run would do with the policy on; changes nothing
+    claude-rc watch                    check, restart/relink/park what is safe, alert on changes
     claude-rc report                   email the daily all-clear
     claude-rc notify-test alerts|report
 
@@ -34,6 +35,7 @@ from .core import (
     ESCALATE_AFTER,
     NEEDS_YOU,
     ChannelHealth,
+    Policy,
     RESTART_GRACE_S,
     Entry,
     History,
@@ -44,6 +46,7 @@ from .core import (
     Restart,
     State,
     Stop,
+    Throttle,
     adopt,
     classify,
     coalesce_queue,
@@ -51,6 +54,7 @@ from .core import (
     diff_changes,
     input_is_empty,
     format_report,
+    is_night,
     plan,
     restart_argv,
     stop_blocker,
@@ -71,6 +75,15 @@ def rotate(path: str, max_bytes: int = LOG_MAX_BYTES) -> None:
             os.replace(path, path + ".1")
     except FileNotFoundError:
         pass
+
+
+def _ago(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s >= 86400:
+        return f"{s // 86400}d{(s % 86400) // 3600}h"
+    if s >= 3600:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 60}m"
 
 
 # claude flags that take a value: kept with their value when recording a session's flags.
@@ -106,8 +119,10 @@ class App:
     def __init__(self, home: str, registry, mux, manifest, state, clock, claude_bin: str,
                  text: Channel, mail: Channel, out: TextIO = sys.stdout, sleep: Callable[[float], None] = time.sleep,
                  trust=None, heartbeat: Optional[Callable[[], object]] = None, hostname: str = "",
-                 health=None, local=None):
+                 health=None, local=None, policy: Optional[Policy] = None, qos=None,
+                 local_hour: Optional[Callable[[float], int]] = None, config_warnings: Sequence[str] = ()):
         from .adapters.files import JsonHealthStore
+        from .adapters.qos import NoThrottle
         from .notify.local import NoNotifier
 
         self.home, self.registry, self.mux, self.manifest, self.state = home, registry, mux, manifest, state
@@ -116,6 +131,12 @@ class App:
         self.health = health if health is not None else JsonHealthStore(os.path.join(home, "health.json"))
         self.local = local if local is not None else NoNotifier()
         self._health: Dict[str, ChannelHealth] = {}
+        self.qos = qos if qos is not None else NoThrottle()
+        policy = policy or Policy()
+        # Without a way to change priority there is nothing to throttle: never plan it.
+        self.policy = replace(policy, throttle_at_night=policy.throttle_at_night and bool(getattr(self.qos, "enabled", False)))
+        self.local_hour = local_hour or (lambda t: time.localtime(t).tm_hour)
+        self.config_warnings = list(config_warnings)
 
     # --- helpers ----------------------------------------------------------------------------
     def log(self, line: str) -> None:
@@ -376,6 +397,7 @@ class App:
 
     def check(self, as_json: bool = False) -> int:
         _, histories, _ = self.state.load()
+        self._health = self.health.load()
         rows = self._observe(self.manifest.load(), histories)
         data = [{"name": o.entry.name, "state": o.state.value, "conversation": o.entry.conversation,
                  "linked": bool(r and r.linked), "status": o.status, "version": r.version if r else None,
@@ -386,6 +408,10 @@ class App:
             json.dump(data, self.out, indent=2)
             self.out.write("\n")
         else:
+            night = self.policy.enabled and is_night(self.policy, self.local_hour(self.clock.now()))
+            print(self._profile_line(night, sum(1 for o, _ in rows if o.state in (State.OK, State.UNLINKED))), file=self.out)
+            for w in self._problems():
+                print(f"attention: {w}", file=self.out)
             for d in data:
                 print(f"{d['state']:<19} {d['name']:<24} {d['conversation'][:8]}  "
                       f"{'linked' if d['linked'] else 'no-link'}  {d['status'] or '-'}"
@@ -417,7 +443,8 @@ class App:
             shown = self.local.notify("claude-rc", msg)
             self.log(f"escalated: {msg}" + ("" if shown else " (no local notification available)"))
         elif event == "recovered":
-            self.log(f"{channel} delivered again after {cur.failures} failed runs")
+            verb = "answering" if channel == "tmux" else "delivered"
+            self.log(f"{channel} {verb} again after {cur.failures} failed runs")
         return event
 
     def _problems(self) -> List[str]:
@@ -425,8 +452,9 @@ class App:
         for channel, h in sorted(self._health.items()):
             if h.failures:
                 since = time.strftime("%Y-%m-%d %H:%M", time.localtime(h.since or self.clock.now()))
-                out.append(f"{channel} not delivered since {since} ({h.failures} runs): {h.last_error}")
-        return out
+                verb = "not answering" if channel == "tmux" else "not delivered"
+                out.append(f"{channel} {verb} since {since} ({h.failures} runs): {h.last_error}")
+        return out + [f"config: {w}" for w in self.config_warnings]
 
     def _relink_blocker(self, name: str) -> Optional[str]:
         """Why typing /remote-control into this pane is not safe right now, or None."""
@@ -444,10 +472,23 @@ class App:
         prev, histories, queued = self.state.load()
         self._health = self.health.load()
         entries = self.manifest.load()
-        rows = self._observe(entries, histories)
+        answered, names = self._session_names()
+        if not answered:  # tmux hung: act on nothing, keep what we knew, still tell the outside we ran
+            if self._track("tmux", "tmux did not answer list-sessions") == "failing":
+                self.log("tmux did not answer; run skipped, state kept")
+            self.state.save(prev, histories, queued)
+            self._beat(prev)
+            self.health.save(self._health)
+            return 0
+        self._track("tmux", None)
         now = self.clock.now()
-        d = plan([o for o, _ in rows], histories, now, self.claude_bin)
+        night = self.policy.enabled and is_night(self.policy, self.local_hour(now))
+        rows = self._observe(entries, histories, names)
+        d = plan([o for o, _ in rows], histories, now, self.claude_bin, self.policy, night)
         conditions, histories = dict(d.conditions), dict(d.histories)
+
+        # Stop first: free memory before anything starts.
+        self._run_stops([a for a in d.actions if isinstance(a, Stop)], conditions, histories)
 
         restarted: List[str] = []
         for a in d.actions:
@@ -476,6 +517,12 @@ class App:
 
         if restarted:
             self._await_restarts(restarted, entries, conditions, histories)
+        self._run_throttles([a for a in d.actions if isinstance(a, Throttle)], histories)
+        for n, c in conditions.items():
+            if c == "PARKED" and prev.get(n) != "PARKED":
+                h = histories.get(n, History())
+                idle = f", idle {_ago(now - h.last_active)}" if h.last_active is not None else ", last use unknown"
+                self.log(f"parked {n} ({h.parked_reason}{idle})")
 
         change = diff_changes(prev, conditions)
         if change:
@@ -490,6 +537,92 @@ class App:
         self.state.save(conditions, histories, queued)
         self._beat(conditions)
         self.health.save(self._health)
+        return 0
+
+    def _run_throttles(self, throttles: List[Throttle], histories: Dict[str, History]) -> None:
+        """Apply background/foreground priority, only to the pid that is still the session's own process."""
+        moved: Dict[bool, List[str]] = {True: [], False: []}
+        for a in throttles:
+            pane = self.mux.pane_info(a.name)
+            done = pane is not None and pane.pid == a.pid and self.qos.background(a.pid, a.on)
+            h = histories.get(a.name)
+            if done:
+                moved[a.on].append(a.name)
+            elif h is not None:
+                # Not applied: remember the truth so the next run tries again (or forgets a gone pid).
+                histories[a.name] = replace(h, throttled_pid=None if a.on or pane is None or pane.pid != a.pid else h.throttled_pid)
+        if moved[True]:
+            self.log("background priority: " + ", ".join(moved[True]))
+        if moved[False]:
+            self.log("normal priority: " + ", ".join(moved[False]))
+
+    def _profile_line(self, night: bool, live: int) -> str:
+        if not self.policy.enabled:
+            return "policy: off (every pinned host is kept running)"
+        p = self.policy
+        limit = f"park after {p.night_idle_minutes} min idle" if night else f"park after {p.idle_park_hours:g} h idle"
+        return (f"policy: on, {'night' if night else 'day'} profile ({limit}); live {live}/{p.max_live}; "
+                f"night {p.night_start_hour:02d}:00-{p.night_end_hour:02d}:00")
+
+    def preview(self, at_hour: Optional[int] = None, as_json: bool = False) -> int:
+        """`claude-rc plan`: what a watch run would do with the policy on, without doing any of it."""
+        _, histories, _ = self.state.load()
+        answered, names = self._session_names()
+        if not answered:
+            print("tmux did not answer", file=self.out)
+            return 1
+        now = self.clock.now()
+        hour = self.local_hour(now) if at_hour is None else at_hour
+        pol = replace(self.policy, enabled=True)
+        night = is_night(pol, hour)
+        rows = self._observe(self.manifest.load(), histories, names)
+        d = plan([o for o, _ in rows], histories, now, self.claude_bin, pol, night)
+        by_pid = {r.pid: r for r in self.registry.live_sessions()}
+        acts: Dict[str, List[object]] = {}
+        for a in d.actions:
+            acts.setdefault(getattr(a, "name", ""), []).append(a)
+        out = []
+        for o, _ in rows:
+            n = o.entry.name
+            would, blocked = "-", ""
+            for a in acts.get(n, []):
+                if isinstance(a, Stop):
+                    would = f"park:{a.reason}"
+                    pane = self.mux.pane_info(n)
+                    text = self.mux.capture(n, 40, ansi=True) if pane is not None else ""
+                    blocked = stop_blocker(by_pid.get(a.pid), pane, text, a.pid, a.status_since) or ""
+                elif isinstance(a, Restart):
+                    would = "restart"
+                elif isinstance(a, Relink):
+                    would = "relink"
+                elif isinstance(a, Throttle) and would == "-":
+                    would = "background" if a.on else "normal priority"
+            if would == "-" and d.conditions.get(n) == "PARKED" and o.state is not State.PARKED:
+                would = f"park:{d.histories[n].parked_reason}"
+            elif would == "-" and o.state in (State.OK, State.UNLINKED):
+                would = "keep"
+            idle = (_ago(now - o.status_since) if o.status == "idle" and o.status_since is not None else "")
+            out.append({"name": n, "state": o.state.value, "tier": o.entry.tier, "status": o.status or "",
+                        "idle": idle, "would": would, "blocked": blocked})
+        live_now = sum(1 for o, _ in rows if o.state in (State.OK, State.UNLINKED))
+        parks = sum(1 for r in out if r["would"].startswith("park:") and r["state"] in ("OK", "UNLINKED") and not r["blocked"])
+        starts = sum(1 for r in out if r["would"] == "restart")
+        if as_json:
+            json.dump({"profile": "night" if night else "day", "hour": hour, "policy_enabled": self.policy.enabled,
+                       "live_now": live_now, "live_after": live_now - parks + starts, "rows": out,
+                       "warnings": self.config_warnings}, self.out, indent=2)
+            self.out.write("\n")
+            return 0
+        print(f"{'night' if night else 'day'} profile at {hour:02d}:00"
+              + ("" if self.policy.enabled else "  (policy is OFF in config.json: showing what enabling it would do)"),
+              file=self.out)
+        print(f"live hosts: {live_now} now -> {live_now - parks + starts} after", file=self.out)
+        print(f"{'NAME':<24} {'STATE':<15} {'TIER':<5} {'STATUS':<8} {'IDLE':<8} {'WOULD':<16} BLOCKED", file=self.out)
+        for r in out:
+            print(f"{r['name']:<24} {r['state']:<15} {r['tier']:<5} {r['status']:<8} {r['idle']:<8} {r['would']:<16} {r['blocked']}",
+                  file=self.out)
+        for w in self.config_warnings:
+            print(f"config: {w}", file=self.out)
         return 0
 
     def _beat(self, conditions: Dict[str, str]) -> None:
@@ -626,7 +759,13 @@ def build_app(home: Optional[str] = None) -> App:
     from .notify import ConfigError, build_email_sender, build_heartbeat_sender, build_text_sender
 
     home = home or os.environ.get("CLAUDE_RC_HOME") or os.path.expanduser("~/.config/claude-rc")
-    config = read_json(os.path.join(home, "config.json"), {})
+    try:
+        config = read_json(os.path.join(home, "config.json"), {})
+    except ValueError as e:  # a typo in config.json must not stop the watchdog
+        print(f"claude-rc: config.json is not valid JSON ({e}); using defaults", file=sys.stderr)
+        config = {}
+    from .core import parse_policy
+    policy, warnings = parse_policy(config.get("policy"))
     env = dict(os.environ)
     env.update(_load_secrets(os.path.join(home, "secrets.env")))
 
@@ -657,10 +796,11 @@ def build_app(home: Optional[str] = None) -> App:
             return time.time()
 
     registry_dir = os.environ.get("CLAUDE_RC_REGISTRY") or os.path.expanduser("~/.claude/sessions")
+    from .adapters.qos import TaskPolicy
     from .notify.local import MacNotification
 
     mux = TmuxMultiplexer()
-    app = App(local=MacNotification(), home=home, registry=FileSessionRegistry(registry_dir), mux=mux,
+    app = App(local=MacNotification(), policy=policy, qos=TaskPolicy(), config_warnings=warnings, home=home, registry=FileSessionRegistry(registry_dir), mux=mux,
                manifest=JsonManifestStore(os.path.join(home, "sessions.json")),
                state=JsonStateStore(os.path.join(home, "state.json")), clock=_Clock(), claude_bin=_claude_bin(),
                text=channel("alerts", build_text_sender), mail=channel("report", build_email_sender),
@@ -683,6 +823,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pk = sub.add_parser("park"); pk.add_argument("names", nargs="+")  # noqa: E702
     upk = sub.add_parser("unpark"); upk.add_argument("names", nargs="*"); upk.add_argument("--all", action="store_true")  # noqa: E702
     c = sub.add_parser("check"); c.add_argument("--json", action="store_true")  # noqa: E702
+    pl = sub.add_parser("plan"); pl.add_argument("--at", type=int, metavar="HOUR"); pl.add_argument("--json", action="store_true")  # noqa: E702
+    pl.add_argument("--dry-run", action="store_true", help="accepted for clarity; plan never changes anything")
     sub.add_parser("watch")
     sub.add_parser("report")
     t = sub.add_parser("notify-test"); t.add_argument("which", choices=["alerts", "report"])  # noqa: E702
@@ -706,6 +848,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return app.unpark(ns.names, ns.all)
     if ns.cmd == "check":
         return app.check(ns.json)
+    if ns.cmd == "plan":
+        return app.preview(ns.at, ns.json)
     if ns.cmd == "watch":
         return app.watch()
     if ns.cmd == "report":
