@@ -159,7 +159,8 @@ class FilesTest(unittest.TestCase):
     def test_state_round_trips_conditions_histories_and_queued_messages(self):
         store = JsonStateStore(os.path.join(self.dir, "state.json"))
         self.assertEqual(store.load(), ({}, {}, []))
-        h = {"a": History(restarts=(1.0, 2.0), last_state=State.STARTING, idle_unlinked_runs=1, relinked_at=3.0)}
+        h = {"a": History(restarts=(1.0, 2.0), last_state=State.STARTING, idle_unlinked_runs=1, relinked_at=3.0,
+                         relinks=2)}
         store.save({"a": "RESTARTED"}, h, ["claude-rc: restarted a"])
         self.assertEqual(store.load(), ({"a": "RESTARTED"}, h, ["claude-rc: restarted a"]))
 

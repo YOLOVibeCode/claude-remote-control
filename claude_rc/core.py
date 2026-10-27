@@ -62,7 +62,8 @@ class History:
     restarts: Tuple[float, ...] = ()
     last_state: Optional[State] = None
     idle_unlinked_runs: int = 0
-    relinked_at: Optional[float] = None
+    relinked_at: Optional[float] = None    # the last time /remote-control was typed in this unlinked streak
+    relinks: int = 0                       # how many times it was typed in this streak
     note: Optional[str] = None  # the last "skipped" reason logged, so a blocked action is logged once per streak
     parked_at: Optional[float] = None       # stopped on purpose; never restarted while set
     parked_reason: Optional[str] = None     # idle | night | budget | manual
@@ -304,6 +305,18 @@ def plan_door(d: DoorConfig, o: DoorObservation, h: History, now: float, argv: L
 
 MAX_RESTARTS_PER_HOUR = 3
 RELINK_AFTER_IDLE_RUNS = 2
+# An outage (a router's nightly pause, an ISP drop) can outlast the first relink, and Remote Control
+# never reconnects by itself, so a stuck link is retyped hourly. Each try resets the idle clock, so stop.
+RELINK_RETRY_S = 3600
+MAX_RELINKS = 6
+
+
+def relink_not_typed(h: History) -> History:
+    """A planned relink was not typed (a draft, copy mode, tmux failed): undo it so the next run tries again."""
+    if h.relinks <= 1:
+        return replace(h, relinked_at=None, relinks=0)
+    return replace(h, relinked_at=(h.relinked_at or 0) - RELINK_RETRY_S, relinks=h.relinks - 1)
+
 
 # Conditions a person has to look at; everything else is fine or being handled.
 NEEDS_YOU = frozenset({"NOT_RUNNING", "WRONG_CONVERSATION", "RESTART_FAILED", "GAVE_UP", "UNLINKED_STUCK", "UNTRUSTED"})
@@ -437,7 +450,7 @@ def plan(observations: List[Observation], histories: Dict[str, History], now: fl
         name = o.entry.name
         h = histories.get(name, History())
         recent = tuple(t for t in h.restarts if now - t < 3600)
-        idle_runs, relinked_at, last = h.idle_unlinked_runs, h.relinked_at, o.state
+        idle_runs, relinked_at, relinks, last = h.idle_unlinked_runs, h.relinked_at, h.relinks, o.state
         parked_at, parked_reason, throttled = h.parked_at, h.parked_reason, h.throttled_pid
         condition = o.state.value
         why = reasons.get(name)
@@ -457,7 +470,7 @@ def plan(observations: List[Observation], histories: Dict[str, History], now: fl
                 throttled = o.pid
             condition, last = "PARKED", State.PARKED
             parked_at, parked_reason = now, why
-            idle_runs, relinked_at = 0, None
+            idle_runs, relinked_at, relinks = 0, None, 0
         elif o.state is State.PARKED:
             condition = "PARKED"
             revive = (why is None and policy.enabled and policy.morning_revive and not night
@@ -484,13 +497,14 @@ def plan(observations: List[Observation], histories: Dict[str, History], now: fl
         elif o.state is State.UNLINKED:
             idle_runs = idle_runs + 1 if o.status == "idle" else 0
             if relinked_at is not None:
-                condition = "UNLINKED_STUCK"
-            elif idle_runs >= RELINK_AFTER_IDLE_RUNS:
+                condition = "UNLINKED_STUCK"    # stays stuck while retrying: one alert, not one per try
+            due = relinked_at is None or (relinks < MAX_RELINKS and now - relinked_at >= RELINK_RETRY_S)
+            if due and idle_runs >= RELINK_AFTER_IDLE_RUNS:
                 actions.append(Relink(name))
                 emitted = True
-                relinked_at = now
+                relinked_at, relinks = now, relinks + 1
         if o.state is not State.UNLINKED:
-            idle_runs, relinked_at = 0, None
+            idle_runs, relinked_at, relinks = 0, None, 0
 
         if live and why is None and o.pid is not None:
             want_bg = (policy.enabled and night and policy.throttle_at_night and o.status == "idle"
@@ -506,8 +520,8 @@ def plan(observations: List[Observation], histories: Dict[str, History], now: fl
 
         conditions[name] = condition
         out[name] = replace(h, restarts=recent, last_state=last, idle_unlinked_runs=idle_runs, relinked_at=relinked_at,
-                            note=h.note if emitted else None, parked_at=parked_at, parked_reason=parked_reason,
-                            last_active=last_active.get(name), throttled_pid=throttled)
+                            relinks=relinks, note=h.note if emitted else None, parked_at=parked_at,
+                            parked_reason=parked_reason, last_active=last_active.get(name), throttled_pid=throttled)
     return Decision(tuple(actions), conditions, out)
 
 

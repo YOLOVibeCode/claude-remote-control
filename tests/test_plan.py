@@ -8,7 +8,9 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from claude_rc.core import (  # noqa: E402
+    MAX_RELINKS,
     NEEDS_YOU,
+    RELINK_RETRY_S,
     Entry,
     History,
     Observation,
@@ -20,6 +22,7 @@ from claude_rc.core import (  # noqa: E402
     Throttle,
     classify,
     plan,
+    relink_not_typed,
 )
 
 CONV = "11111111-1111-1111-1111-111111111111"
@@ -113,10 +116,43 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(d.conditions["app"], "UNLINKED_STUCK")
         self.assertIn("UNLINKED_STUCK", NEEDS_YOU)
 
+    def test_a_stuck_link_is_retyped_an_hour_later_and_stays_stuck(self):
+        h = {"app": History(idle_unlinked_runs=8, relinked_at=NOW - RELINK_RETRY_S, relinks=1)}
+        d = self.run_plan(obs(State.UNLINKED, status="idle"), histories=h)
+        self.assertEqual(d.actions, (Relink(name="app"),))
+        self.assertEqual(d.conditions["app"], "UNLINKED_STUCK")   # not "UNLINKED": that would read as recovered
+        self.assertEqual((d.histories["app"].relinked_at, d.histories["app"].relinks), (NOW, 2))
+
+    def test_relink_retries_stop_at_the_limit(self):
+        h = {"app": History(idle_unlinked_runs=40, relinked_at=NOW - 5 * H, relinks=MAX_RELINKS)}
+        d = self.run_plan(obs(State.UNLINKED, status="idle"), histories=h)
+        self.assertEqual(d.actions, ())
+        self.assertEqual(d.conditions["app"], "UNLINKED_STUCK")
+
+    def test_a_retry_waits_for_two_idle_runs(self):
+        h = {"app": History(idle_unlinked_runs=8, relinked_at=NOW - 2 * H, relinks=1)}
+        d = self.run_plan(obs(State.UNLINKED, status="busy"), histories=h)
+        self.assertEqual(d.actions, ())
+        self.assertEqual(d.conditions["app"], "UNLINKED_STUCK")
+        d = self.run_plan(obs(State.UNLINKED, status="idle"), histories=d.histories)
+        self.assertEqual(d.actions, ())
+        d = self.run_plan(obs(State.UNLINKED, status="idle"), histories=d.histories)
+        self.assertEqual(d.actions, (Relink(name="app"),))
+
+    def test_a_relink_that_was_not_typed_is_tried_again_next_run(self):
+        first = relink_not_typed(History(relinked_at=NOW, relinks=1, idle_unlinked_runs=2))
+        self.assertEqual((first.relinked_at, first.relinks), (None, 0))
+        retry = relink_not_typed(History(relinked_at=NOW, relinks=3, idle_unlinked_runs=9))
+        self.assertEqual(retry.relinks, 2)
+        d = self.run_plan(obs(State.UNLINKED, status="idle"), histories={"app": retry})
+        self.assertEqual(d.actions, (Relink(name="app"),))
+        self.assertEqual(d.conditions["app"], "UNLINKED_STUCK")
+
     def test_ok_clears_relink_memory(self):
-        h = {"app": History(idle_unlinked_runs=3, relinked_at=NOW - 600)}
+        h = {"app": History(idle_unlinked_runs=3, relinked_at=NOW - 600, relinks=2)}
         d = self.run_plan(obs(State.OK), histories=h)
         self.assertEqual(d.histories["app"].relinked_at, None)
+        self.assertEqual(d.histories["app"].relinks, 0)
         self.assertEqual(d.histories["app"].idle_unlinked_runs, 0)
         self.assertEqual(d.conditions["app"], "OK")
 
