@@ -63,6 +63,7 @@ from .core import (
     is_night,
     plan,
     plan_door,
+    relink_not_typed,
     restart_argv,
     stop_blocker,
     track_delivery,
@@ -345,7 +346,7 @@ class App:
                     print(f"{e.name}: {err}", file=self.out)
                     continue
                 histories[e.name] = replace(h, restarts=h.restarts + (now,), last_state=State.STARTING,
-                                            idle_unlinked_runs=0, relinked_at=None, parked_at=None,
+                                            idle_unlinked_runs=0, relinked_at=None, relinks=0, parked_at=None,
                                             parked_reason=None, note=None)
                 print(f"started {e.name} on {e.conversation[:8]}", file=self.out)
                 self.log(f"up: started {e.name}")
@@ -541,7 +542,7 @@ class App:
                         self.log(f"relink {a.name} failed: {e}")
                 if blocker is not None:
                     # Try again next run; log the reason once per streak, not every 10 minutes.
-                    histories[a.name] = replace(h, relinked_at=None, note=blocker)
+                    histories[a.name] = replace(relink_not_typed(h), note=blocker)
                     if h.note != blocker:
                         self.log(f"relink skipped for {a.name}: {blocker}")
 

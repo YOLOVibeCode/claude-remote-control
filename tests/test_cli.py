@@ -503,6 +503,23 @@ class AppTest(unittest.TestCase):
         self.assertEqual(len([c for c in self.mux.calls if c[0] == "keys"]), 1)
         self.assertIn("needs you app (Remote Control still off after relink)", self.text.sent[-1][1])
 
+    def test_a_stuck_link_is_retyped_hourly_with_one_alert(self):
+        self.pin_app()
+        self.mux.sessions.add("app")
+        self.reg.records = [Record(1, CONV, "/w/app", "app", "idle", False, "2.1.291", True)]
+        for _ in range(3):   # wait a run, relink, then reported stuck
+            self.app().watch()
+            self.clock.t += 600
+        sent = len(self.text.sent)
+        for _ in range(6):   # an hour on
+            self.app().watch()
+            self.clock.t += 600
+        self.assertEqual([c for c in self.mux.calls if c[0] == "keys"], [("keys", "app", "/remote-control")] * 2)
+        self.assertEqual(len(self.text.sent), sent)
+        self.reg.records = [Record(1, CONV, "/w/app", "app", "idle", True, "2.1.291", True)]
+        self.app().watch()
+        self.assertEqual(len(self.text.sent), sent)   # recoveries go to the log and the report, not a text
+
     def test_relink_never_types_over_a_draft(self):
         self.pin_app()
         self.mux.sessions.add("app")
